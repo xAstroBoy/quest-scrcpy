@@ -13,14 +13,15 @@ On top of that, the Quest mirrors the stereoscopic, lens-distorted view. This cl
 ## Features
 
 - 🎯 Device & display pickers over adb (shows every display the Quest exposes)
+- 📶 **Wireless adb** — connect a Quest by `ip[:port]`; remembered addresses get one-click reconnect chips + "Connect all"
 - 🥽 **One-click Quest 3 preset** — left eye, lens flattened, leveled
 - 🔍 Live crop: drag to pan, scroll to zoom, eye/full presets
 - 🪞 **Flatten lens**: live radial-distortion + tilt correction (de-fisheye the VR view)
 - 🔊 Audio toggle (AAC via Media Foundation → cpal)
 - 📷 Screenshot the current crop to PNG
-- ⏺ **Record** the stream to `.mp4` (H.264 passthrough mux — lossless, no re-encode)
+- ⏺ **Record** to `.mp4` — captures exactly the processed view you see (cropped, lens-flattened, tilted); the CLI can also do a lossless full-panel passthrough
 - ⚡ Low-latency pipeline: `MF_LOW_LATENCY` decode, no-vsync present, multi-threaded NV12→RGBA
-- 💾 Settings (lens/tilt/crop/quality) auto-saved and restored between launches
+- 💾 Settings (lens/tilt/crop/quality + remembered devices) auto-saved and restored between launches
 - 🖥️ Both a GUI and a CLI
 
 ## Requirements
@@ -43,9 +44,11 @@ CLI helpers:
 
 ```sh
 quest-scrcpy list                       # list adb devices
+quest-scrcpy connect 192.168.1.40       # adb connect over Wi-Fi (defaults to :5555)
 quest-scrcpy displays --serial <SERIAL> # list device displays
-quest-scrcpy record --serial <SERIAL> -n 15 -o clip.mp4   # headless 15s clip
-quest-scrcpy shot --serial <SERIAL> -o frame.png          # single-frame grab
+quest-scrcpy record --serial <SERIAL> -n 15 -o clip.mp4               # 15s full-panel clip (lossless)
+quest-scrcpy record --serial <SERIAL> --crop left --flatten -o eye.mp4 # one-eye, lens-flattened clip
+quest-scrcpy shot --serial <SERIAL> -o frame.png                      # single-frame grab
 ```
 
 In the GUI: pick your Quest, hit **Connect**, click **🥽 Quest 3** for the tuned view, then fine-tune **Flatten lens** (`curve`/`edge`) and `tilt°` if needed. Screenshots and clips land in a `captures/` folder next to the executable.
