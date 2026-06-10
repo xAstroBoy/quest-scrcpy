@@ -7,7 +7,7 @@
 
 use crate::adb::{self, ServerOptions};
 use crate::decoder::{Frame, H264Decoder};
-use crate::recorder::Recorder;
+use crate::recorder::ClipEncoder;
 use crate::server;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -44,9 +44,26 @@ pub struct FrameSlot {
     pub generation: u64,
 }
 
-/// UI -> stream-thread recording commands.
+/// The crop + lens-flatten + tilt the GUI is showing, so a recording can match
+/// exactly what's on screen. `uv` is [min_x, min_y, max_x, max_y].
+#[derive(Clone, Copy, Debug)]
+pub struct ViewParams {
+    pub uv: [f32; 4],
+    pub lens_correct: bool,
+    pub k1: f32,
+    pub k2: f32,
+    pub rotation_deg: f32,
+}
+
+impl Default for ViewParams {
+    fn default() -> Self {
+        Self { uv: [0.0, 0.0, 1.0, 1.0], lens_correct: false, k1: 0.0, k2: 0.0, rotation_deg: 0.0 }
+    }
+}
+
+/// UI -> stream-thread recording commands. `Start` carries the view to capture.
 enum RecordCmd {
-    Start(PathBuf),
+    Start(PathBuf, ViewParams),
     Stop,
 }
 
@@ -113,8 +130,8 @@ impl StreamHandle {
         self.recording.load(Ordering::Relaxed)
     }
 
-    pub fn start_recording(&self, path: PathBuf) {
-        let _ = self.record_tx.send(RecordCmd::Start(path));
+    pub fn start_recording(&self, path: PathBuf, view: ViewParams) {
+        let _ = self.record_tx.send(RecordCmd::Start(path, view));
     }
 
     pub fn stop_recording(&self) {
@@ -245,39 +262,30 @@ fn stream_loop(cfg: &StreamConfig, ctx: &Ctx, port: u16) -> Result<()> {
     let mut frames_since = 0u32;
     let mut last_tick = Instant::now();
 
-    // Recording state.
-    let mut recorder: Option<Recorder> = None;
-    let mut last_config: Vec<u8> = Vec::new(); // most recent SPS/PPS
-    let mut pending_record: Option<PathBuf> = None; // start once we have config
-    let mut waiting_key = false; // don't write until the first keyframe
+    // Recording state. The clip is encoded from the *processed* (cropped, lens-
+    // flattened, rotated) view so it matches what's on screen. Its dimensions are
+    // fixed at start, so we wait for the first decoded frame to size the encoder.
+    let mut clip: Option<ClipEncoder> = None;
+    let mut rec_params = ViewParams::default();
+    let mut pending_record: Option<(PathBuf, ViewParams)> = None;
 
     while !ctx.stop.load(Ordering::Relaxed) {
         // Apply any pending record commands first.
         while let Ok(cmd) = ctx.record_rx.try_recv() {
             match cmd {
-                RecordCmd::Start(path) => {
-                    if let Some(r) = recorder.take() {
-                        let _ = r.finalize();
+                RecordCmd::Start(path, view) => {
+                    if let Some(c) = clip.take() {
+                        let _ = c.finalize();
                     }
-                    if !last_config.is_empty() && sess_w > 0 {
-                        match Recorder::new(&path, sess_w, sess_h, cfg.max_fps, &last_config) {
-                            Ok(r) => {
-                                recorder = Some(r);
-                                waiting_key = true;
-                                ctx.recording.store(true, Ordering::Relaxed);
-                                eprintln!("[record] started -> {}", path.display());
-                            }
-                            Err(e) => eprintln!("[record] failed to start: {e:#}"),
-                        }
-                    } else {
-                        // No config yet: arm it, start when the next config arrives.
-                        pending_record = Some(path);
-                    }
+                    // Arm it; the encoder is created on the next decoded frame,
+                    // once we know the source frame size to crop from.
+                    pending_record = Some((path, view));
+                    rec_params = view;
                 }
                 RecordCmd::Stop => {
                     pending_record = None;
-                    if let Some(r) = recorder.take() {
-                        match r.finalize() {
+                    if let Some(c) = clip.take() {
+                        match c.finalize() {
                             Ok(()) => eprintln!("[record] saved"),
                             Err(e) => eprintln!("[record] finalize error: {e:#}"),
                         }
@@ -308,45 +316,6 @@ fn stream_loop(cfg: &StreamConfig, ctx: &Ctx, port: u16) -> Result<()> {
                 }
             }
             server::StreamEvent::Packet(pkt) => {
-                if pkt.is_config {
-                    last_config = pkt.data.clone();
-                    // Honor a record request that came in before we had config.
-                    if let Some(path) = pending_record.take() {
-                        if sess_w > 0 {
-                            match Recorder::new(&path, sess_w, sess_h, cfg.max_fps, &last_config) {
-                                Ok(r) => {
-                                    recorder = Some(r);
-                                    waiting_key = true;
-                                    ctx.recording.store(true, Ordering::Relaxed);
-                                    eprintln!("[record] started -> {}", path.display());
-                                }
-                                Err(e) => eprintln!("[record] failed to start: {e:#}"),
-                            }
-                        } else {
-                            pending_record = Some(path);
-                        }
-                    }
-                }
-
-                // Feed the recorder (config packets are folded into the first
-                // keyframe by the recorder, so we only forward real frames).
-                if let Some(rec) = recorder.as_mut() {
-                    if !pkt.is_config {
-                        if waiting_key && !pkt.is_key {
-                            // skip leading non-keyframes for a clean start
-                        } else {
-                            waiting_key = false;
-                            if let Err(e) = rec.write(&pkt.data, pkt.pts, pkt.is_key) {
-                                eprintln!("[record] write error: {e:#}");
-                                if let Some(r) = recorder.take() {
-                                    let _ = r.finalize();
-                                }
-                                ctx.recording.store(false, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-
                 if decoder.is_none() {
                     let w = if sess_w > 0 { sess_w } else { 1920 };
                     let h = if sess_h > 0 { sess_h } else { 1088 };
@@ -358,6 +327,34 @@ fn stream_loop(cfg: &StreamConfig, ctx: &Ctx, port: u16) -> Result<()> {
                 for frame in dec.decode(&pkt.data)? {
                     frame_w = frame.width;
                     frame_h = frame.height;
+
+                    // Start a pending recording now that we know the frame size.
+                    if let Some((path, view)) = pending_record.take() {
+                        let (ow, oh) = output_dims(&view, frame.width, frame.height);
+                        match ClipEncoder::new(&path, ow, oh, cfg.max_fps, cfg.video_bit_rate) {
+                            Ok(c) => {
+                                rec_params = view;
+                                clip = Some(c);
+                                ctx.recording.store(true, Ordering::Relaxed);
+                                eprintln!("[record] started -> {} ({ow}x{oh})", path.display());
+                            }
+                            Err(e) => eprintln!("[record] failed to start: {e:#}"),
+                        }
+                    }
+
+                    // Encode the processed (cropped/flattened) view of this frame.
+                    if let Some(enc) = clip.as_mut() {
+                        let (ow, oh) = enc.dims();
+                        let bgra = warp_to_bgra(&frame, &rec_params, ow, oh);
+                        if let Err(e) = enc.write_bgra(&bgra, pkt.pts) {
+                            eprintln!("[record] write error: {e:#}");
+                            if let Some(c) = clip.take() {
+                                let _ = c.finalize();
+                            }
+                            ctx.recording.store(false, Ordering::Relaxed);
+                        }
+                    }
+
                     {
                         let mut s = ctx.slot.lock().unwrap();
                         s.frame = Some(frame);
@@ -381,12 +378,79 @@ fn stream_loop(cfg: &StreamConfig, ctx: &Ctx, port: u16) -> Result<()> {
         }
     }
 
-    if let Some(r) = recorder.take() {
-        let _ = r.finalize();
+    if let Some(c) = clip.take() {
+        let _ = c.finalize();
     }
     ctx.recording.store(false, Ordering::Relaxed);
     if let Some(h) = audio_handle {
         h.stop();
     }
     Ok(())
+}
+
+/// Output (recording) dimensions for a crop, rounded to even (H.264 needs it).
+pub fn output_dims(p: &ViewParams, frame_w: u32, frame_h: u32) -> (u32, u32) {
+    let w = (((p.uv[2] - p.uv[0]) * frame_w as f32).round() as u32).max(2);
+    let h = (((p.uv[3] - p.uv[1]) * frame_h as f32).round() as u32).max(2);
+    (w & !1, h & !1)
+}
+
+/// Render the processed (cropped + lens-flattened + rotated) view of `frame`
+/// into a top-down BGRA buffer of `out_w`×`out_h` — the inverse of the GPU mesh
+/// in the GUI, so a recording matches what's on screen. Parallelised by rows.
+pub fn warp_to_bgra(frame: &Frame, p: &ViewParams, out_w: u32, out_h: u32) -> Vec<u8> {
+    let fw = frame.width as f32;
+    let fh = frame.height as f32;
+    let (k1, k2) = if p.lens_correct { (p.k1, p.k2) } else { (0.0, 0.0) };
+    let (sin, cos) = p.rotation_deg.to_radians().sin_cos();
+    let crop_min_x = p.uv[0] * fw;
+    let crop_min_y = p.uv[1] * fh;
+    let crop_w = (p.uv[2] - p.uv[0]) * fw;
+    let crop_h = (p.uv[3] - p.uv[1]) * fh;
+
+    let ow = out_w as usize;
+    let oh = out_h as usize;
+    let fwi = frame.width as usize;
+    let fhi = frame.height as usize;
+    let src = &frame.rgba;
+    let mut out = vec![0u8; ow * oh * 4];
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8);
+    let rows_per = oh.div_ceil(threads);
+
+    std::thread::scope(|sc| {
+        for (ci, chunk) in out.chunks_mut(rows_per * ow * 4).enumerate() {
+            let y0 = ci * rows_per;
+            let src = &*src;
+            sc.spawn(move || {
+                let rows = chunk.len() / (ow * 4);
+                for r in 0..rows {
+                    let j = y0 + r;
+                    let oy = 2.0 * j as f32 / (oh as f32 - 1.0) - 1.0;
+                    for i in 0..ow {
+                        let ox = 2.0 * i as f32 / (ow as f32 - 1.0) - 1.0;
+                        // Inverse rotation R(-angle) to find the pre-rotation coord.
+                        let rx = ox * cos + oy * sin;
+                        let ry = -ox * sin + oy * cos;
+                        let r2 = rx * rx + ry * ry;
+                        let f = 1.0 + k1 * r2 + k2 * r2 * r2;
+                        let sx = (0.5 + 0.5 * rx * f).clamp(0.0, 1.0);
+                        let sy = (0.5 + 0.5 * ry * f).clamp(0.0, 1.0);
+                        let px = (crop_min_x + sx * crop_w) as usize;
+                        let py = (crop_min_y + sy * crop_h) as usize;
+                        let si = (py.min(fhi - 1) * fwi + px.min(fwi - 1)) * 4;
+                        let o = (r * ow + i) * 4;
+                        chunk[o] = src[si + 2]; // B
+                        chunk[o + 1] = src[si + 1]; // G
+                        chunk[o + 2] = src[si]; // R
+                        chunk[o + 3] = 255;
+                    }
+                }
+            });
+        }
+    });
+    out
 }

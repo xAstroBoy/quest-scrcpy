@@ -63,6 +63,12 @@ enum Command {
         /// Output .mp4 path.
         #[arg(short, long, default_value = "clip.mp4")]
         output: String,
+        /// Crop: full | left | right (one eye). Default full (raw passthrough).
+        #[arg(long, default_value = "full")]
+        crop: String,
+        /// Flatten the Quest lens distortion (re-encodes; implies a crop).
+        #[arg(long)]
+        flatten: bool,
     },
 }
 
@@ -162,8 +168,8 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Record { args, seconds, output }) => {
-            run_record(args, seconds, output.into())
+        Some(Command::Record { args, seconds, output, crop, flatten }) => {
+            run_record(args, seconds, output.into(), &crop, flatten)
         }
         Some(Command::Shot { args, output }) => run_shot(args, output.into()),
     }
@@ -231,10 +237,20 @@ fn run_shot(args: MirrorArgs, output: std::path::PathBuf) -> Result<()> {
     result
 }
 
-/// Headless capture: connect, mux the raw H.264 to MP4 for `seconds`, exit.
+/// Headless capture. `full` + no flatten = lossless raw passthrough mux; a crop
+/// or `--flatten` switches to re-encoding the processed (cropped/flattened) view.
 #[allow(unused_assignments)]
-fn run_record(args: MirrorArgs, seconds: u64, output: std::path::PathBuf) -> Result<()> {
+fn run_record(
+    args: MirrorArgs,
+    seconds: u64,
+    output: std::path::PathBuf,
+    crop: &str,
+    flatten: bool,
+) -> Result<()> {
     use crate::adb::ServerOptions;
+    use crate::decoder::H264Decoder;
+    use crate::recorder::{ClipEncoder, Recorder};
+    use crate::stream::{ViewParams, output_dims, warp_to_bgra};
     use std::time::{Duration, Instant};
 
     let serial = pick_serial(args.serial)?;
@@ -257,37 +273,87 @@ fn run_record(args: MirrorArgs, seconds: u64, output: std::path::PathBuf) -> Res
     };
     let mut child = adb::start_server(&serial, &opts)?;
 
+    let uv = match crop {
+        "left" => [0.0, 0.0, 0.5, 1.0],
+        "right" => [0.5, 0.0, 1.0, 1.0],
+        _ => [0.0, 0.0, 1.0, 1.0],
+    };
+    let processed = flatten || crop != "full";
+    let view = ViewParams {
+        uv,
+        lens_correct: flatten,
+        k1: 0.02,
+        k2: -0.20,
+        rotation_deg: if flatten { -1.0 } else { 0.0 },
+    };
+
     let result = (|| -> Result<()> {
         let conn = server::connect(port, false, Duration::from_secs(12))?;
         let mut video = conn.video;
         println!("Recording {seconds}s from {serial} -> {}…", output.display());
-
-        let mut recorder: Option<recorder::Recorder> = None;
-        let mut last_config: Vec<u8> = Vec::new();
-        let mut waiting_key = true;
-        let (mut sw, mut sh) = (0u32, 0u32);
         let deadline = Instant::now() + Duration::from_secs(seconds);
 
-        while Instant::now() < deadline {
-            match server::read_event(&mut video)? {
-                server::StreamEvent::Resolution { width, height } => {
-                    sw = width;
-                    sh = height;
-                }
-                server::StreamEvent::Packet(pkt) => {
-                    if pkt.is_config {
-                        last_config = pkt.data.clone();
-                        if recorder.is_none() && sw > 0 {
-                            recorder = Some(recorder::Recorder::new(
-                                &output, sw, sh, max_fps, &last_config,
-                            )?);
+        if processed {
+            // Decode -> warp to the processed view -> re-encode.
+            let mut decoder: Option<H264Decoder> = None;
+            let mut enc: Option<ClipEncoder> = None;
+            let (mut sw, mut sh) = (0u32, 0u32);
+            while Instant::now() < deadline {
+                match server::read_event(&mut video)? {
+                    server::StreamEvent::Resolution { width, height } => {
+                        sw = width;
+                        sh = height;
+                        decoder = Some(H264Decoder::new(width.max(1), height.max(1))?);
+                    }
+                    server::StreamEvent::Packet(pkt) => {
+                        if decoder.is_none() {
+                            decoder = Some(H264Decoder::new(sw.max(1920), sh.max(1088))?);
+                        }
+                        for frame in decoder.as_mut().unwrap().decode(&pkt.data)? {
+                            if enc.is_none() {
+                                let (ow, oh) = output_dims(&view, frame.width, frame.height);
+                                enc = Some(ClipEncoder::new(
+                                    &output, ow, oh, max_fps, opts.video_bit_rate,
+                                )?);
+                                println!("  processed view {ow}x{oh}");
+                            }
+                            let (ow, oh) = enc.as_ref().unwrap().dims();
+                            let bgra = warp_to_bgra(&frame, &view, ow, oh);
+                            enc.as_mut().unwrap().write_bgra(&bgra, pkt.pts)?;
                         }
                     }
-                    if let Some(r) = recorder.as_mut() {
-                        if !pkt.is_config {
-                            if waiting_key && !pkt.is_key {
-                                // wait for first keyframe
-                            } else {
+                }
+            }
+            match enc {
+                Some(e) => {
+                    e.finalize()?;
+                    println!("Saved {}", output.display());
+                }
+                None => println!("No video received; nothing recorded."),
+            }
+        } else {
+            // Lossless raw passthrough mux.
+            let mut recorder: Option<Recorder> = None;
+            let mut last_config: Vec<u8> = Vec::new();
+            let mut waiting_key = true;
+            let (mut sw, mut sh) = (0u32, 0u32);
+            while Instant::now() < deadline {
+                match server::read_event(&mut video)? {
+                    server::StreamEvent::Resolution { width, height } => {
+                        sw = width;
+                        sh = height;
+                    }
+                    server::StreamEvent::Packet(pkt) => {
+                        if pkt.is_config {
+                            last_config = pkt.data.clone();
+                            if recorder.is_none() && sw > 0 {
+                                recorder = Some(Recorder::new(
+                                    &output, sw, sh, max_fps, &last_config,
+                                )?);
+                            }
+                        }
+                        if let Some(r) = recorder.as_mut() {
+                            if !pkt.is_config && !(waiting_key && !pkt.is_key) {
                                 waiting_key = false;
                                 r.write(&pkt.data, pkt.pts, pkt.is_key)?;
                             }
@@ -295,14 +361,13 @@ fn run_record(args: MirrorArgs, seconds: u64, output: std::path::PathBuf) -> Res
                     }
                 }
             }
-        }
-
-        match recorder {
-            Some(r) => {
-                r.finalize()?;
-                println!("Saved {}", output.display());
+            match recorder {
+                Some(r) => {
+                    r.finalize()?;
+                    println!("Saved {}", output.display());
+                }
+                None => println!("No video received; nothing recorded."),
             }
-            None => println!("No video received; nothing recorded."),
         }
         Ok(())
     })();

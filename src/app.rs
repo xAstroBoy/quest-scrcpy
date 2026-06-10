@@ -5,7 +5,7 @@
 use crate::adb::{self, Device, DisplayInfo};
 use crate::config::Config;
 use crate::decoder::Frame;
-use crate::stream::{Status, StreamConfig, StreamHandle};
+use crate::stream::{Status, StreamConfig, StreamHandle, ViewParams};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, pos2, vec2};
 use std::path::PathBuf;
@@ -395,14 +395,29 @@ impl App {
 
     /// Toggle clip recording on the active stream.
     fn toggle_recording(&mut self) {
-        let Some(stream) = &self.stream else { return };
-        if stream.is_recording() {
-            stream.stop_recording();
+        let recording = self.stream.as_ref().map(|s| s.is_recording()).unwrap_or(false);
+        if self.stream.is_none() {
+            return;
+        }
+        if recording {
+            if let Some(s) = &self.stream {
+                s.stop_recording();
+            }
             self.capture_msg = Some("⏹ Recording saved.".into());
         } else {
+            // Capture exactly what's on screen: current crop + lens + tilt.
+            let view = ViewParams {
+                uv: [self.uv.min.x, self.uv.min.y, self.uv.max.x, self.uv.max.y],
+                lens_correct: self.lens_correct,
+                k1: self.lens_k1,
+                k2: self.lens_k2,
+                rotation_deg: self.rotation_deg,
+            };
             match capture_path("clip", "mp4") {
                 Ok(path) => {
-                    stream.start_recording(path.clone());
+                    if let Some(s) = &self.stream {
+                        s.start_recording(path.clone(), view);
+                    }
                     self.capture_msg = Some(format!("⏺ Recording to {}", path.display()));
                 }
                 Err(e) => self.capture_msg = Some(format!("Record failed: {e}")),
