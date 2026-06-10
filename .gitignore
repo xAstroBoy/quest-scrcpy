@@ -8,6 +8,7 @@ quest-scrcpy.cfg
 # Local test / diagnostic artifacts
 *.mp4
 *.png
+*.log
 *_log.txt
 server_log.txt
 diag_shot.png
