@@ -124,6 +124,42 @@ pub fn push_server(serial: &str) -> Result<()> {
     Ok(())
 }
 
+/// Normalise a user-typed address: add the default wireless-adb port if absent.
+pub fn normalize_addr(addr: &str) -> String {
+    let addr = addr.trim();
+    if addr.contains(':') {
+        addr.to_string()
+    } else {
+        format!("{addr}:5555")
+    }
+}
+
+/// `adb connect <ip:port>`. Returns adb's status line on success.
+pub fn connect(addr: &str) -> Result<String> {
+    let addr = normalize_addr(addr);
+    let out = command(&["connect", &addr])
+        .output()
+        .context("failed to run `adb connect`")?;
+    let mut text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        text = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    }
+    let low = text.to_lowercase();
+    if low.contains("fail") || low.contains("cannot") || low.contains("unable") || low.contains("refused") {
+        bail!("{text}");
+    }
+    Ok(if text.is_empty() { format!("connected to {addr}") } else { text })
+}
+
+/// `adb disconnect <ip:port>`. Best-effort.
+pub fn disconnect(addr: &str) {
+    let addr = normalize_addr(addr);
+    let _ = command(&["disconnect", &addr])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// `adb forward tcp:<port> localabstract:scrcpy`. Returns the chosen local port.
 pub fn forward(serial: &str, port: u16) -> Result<u16> {
     let local = format!("tcp:{port}");

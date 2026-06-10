@@ -83,6 +83,13 @@ pub struct App {
     need_display_fetch: bool,
     fetch_inflight: bool,
 
+    /// Wireless-adb: the ip:port being typed, remembered addresses, and the
+    /// result of an in-flight `adb connect` running on a background thread.
+    remote_input: String,
+    remotes: Vec<String>,
+    connect_result: Arc<Mutex<Option<(String, Result<String, String>)>>>,
+    connecting: bool,
+
     /// Last-persisted settings + a debounce timer, so edits auto-save shortly
     /// after the user stops fiddling (rather than thrashing the disk each frame).
     persisted: Config,
@@ -139,6 +146,10 @@ impl App {
             want_autostart: startup.autostart,
             need_display_fetch: false,
             fetch_inflight: false,
+            remote_input: String::new(),
+            remotes: cfg.remotes.clone(),
+            connect_result: Arc::new(Mutex::new(None)),
+            connecting: false,
             persisted: cfg,
             dirty_since: None,
         };
@@ -286,6 +297,68 @@ impl App {
             bitrate_mbps: self.settings.bitrate_mbps,
             max_fps: self.settings.max_fps,
             audio: self.settings.audio,
+            remotes: self.remotes.clone(),
+        }
+    }
+
+    /// Kick off `adb connect <addr>` on a background thread (network calls can
+    /// hang on a bad address, so never run them on the UI thread).
+    fn start_remote_connect(&mut self, addr: String, ctx: egui::Context) {
+        let addr = adb::normalize_addr(&addr);
+        if addr.is_empty() || self.connecting {
+            return;
+        }
+        self.connecting = true;
+        self.capture_msg = Some(format!("🔗 Connecting to {addr}…"));
+        let slot = self.connect_result.clone();
+        std::thread::spawn(move || {
+            let res = adb::connect(&addr).map_err(|e| format!("{e:#}"));
+            *slot.lock().unwrap() = Some((addr, res));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Connect every remembered address (sequentially) on one background thread.
+    fn start_connect_all(&mut self, ctx: egui::Context) {
+        if self.connecting || self.remotes.is_empty() {
+            return;
+        }
+        self.connecting = true;
+        self.capture_msg = Some("🔗 Connecting saved devices…".into());
+        let slot = self.connect_result.clone();
+        let remotes = self.remotes.clone();
+        std::thread::spawn(move || {
+            let mut ok = 0usize;
+            for r in &remotes {
+                if adb::connect(r).is_ok() {
+                    ok += 1;
+                }
+            }
+            *slot.lock().unwrap() =
+                Some(("*".to_string(), Ok(format!("connected {ok}/{}", remotes.len()))));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Apply the result of a finished `adb connect`.
+    fn poll_connect(&mut self) {
+        let taken = self.connect_result.lock().unwrap().take();
+        let Some((addr, res)) = taken else { return };
+        self.connecting = false;
+        match res {
+            Ok(msg) => {
+                self.capture_msg = Some(format!("🔗 {msg}"));
+                if !self.remotes.contains(&addr) {
+                    self.remotes.push(addr.clone());
+                }
+                self.refresh_devices();
+                // Prefer the freshly-connected device.
+                if self.devices.iter().any(|d| d.serial == addr && d.state == "device") {
+                    self.selected_serial = Some(addr);
+                    self.request_display_fetch();
+                }
+            }
+            Err(e) => self.capture_msg = Some(format!("Connect failed: {e}")),
         }
     }
 
@@ -380,6 +453,7 @@ impl eframe::App for App {
             self.request_display_fetch(); // happens once the stream is up
             self.connect(ctx);
         }
+        self.poll_connect();
         self.poll_displays();
         self.drive_display_fetch();
         self.sync_texture(ctx);
@@ -451,6 +525,65 @@ impl App {
                             ui.selectable_value(&mut self.settings.display_id, d.id, d.label());
                         }
                     });
+            });
+
+            // Wireless adb: connect to / remember Quests over the network.
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Wi-Fi:").on_hover_text(
+                    "adb connect a Quest over the network. Enable wireless debugging on \
+                     the headset (or run `adb tcpip 5555` over USB first).",
+                );
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.remote_input)
+                        .hint_text("192.168.x.x[:5555]")
+                        .desired_width(150.0),
+                );
+                let entered =
+                    resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let clicked = ui
+                    .add_enabled(!self.connecting, egui::Button::new("🔗 Connect"))
+                    .clicked();
+                if (clicked || entered) && !self.remote_input.trim().is_empty() {
+                    let addr = self.remote_input.trim().to_string();
+                    self.remote_input.clear();
+                    self.start_remote_connect(addr, ctx.clone());
+                }
+                if self.connecting {
+                    ui.spinner();
+                }
+
+                if !self.remotes.is_empty() {
+                    ui.separator();
+                    if ui
+                        .add_enabled(!self.connecting, egui::Button::new("Connect all"))
+                        .on_hover_text("adb connect every saved address")
+                        .clicked()
+                    {
+                        self.start_connect_all(ctx.clone());
+                    }
+                    let mut connect_one = None;
+                    let mut forget = None;
+                    for r in self.remotes.clone() {
+                        if ui
+                            .add_enabled(!self.connecting, egui::Button::new(format!("🔗 {r}")))
+                            .on_hover_text("Reconnect & select")
+                            .clicked()
+                        {
+                            connect_one = Some(r.clone());
+                        }
+                        if ui.small_button("✕").on_hover_text("Forget").clicked() {
+                            forget = Some(r.clone());
+                        }
+                    }
+                    if let Some(r) = connect_one {
+                        self.start_remote_connect(r, ctx.clone());
+                    }
+                    if let Some(r) = forget {
+                        adb::disconnect(&r);
+                        self.remotes.retain(|x| x != &r);
+                    }
+                }
             });
 
             ui.add_space(2.0);

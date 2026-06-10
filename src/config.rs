@@ -17,6 +17,8 @@ pub struct Config {
     pub bitrate_mbps: u32,
     pub max_fps: u32,
     pub audio: bool,
+    /// Remembered wireless-adb addresses (ip:port) for quick reconnect.
+    pub remotes: Vec<String>,
 }
 
 impl Default for Config {
@@ -33,6 +35,7 @@ impl Default for Config {
             bitrate_mbps: 16,
             max_fps: 0,
             audio: false,
+            remotes: Vec::new(),
         }
     }
 }
@@ -68,6 +71,12 @@ impl Config {
                 "bitrate_mbps" => c.bitrate_mbps = v.parse().unwrap_or(c.bitrate_mbps),
                 "max_fps" => c.max_fps = v.parse().unwrap_or(c.max_fps),
                 "audio" => c.audio = v == "true",
+                "remote" => {
+                    let r = v.to_string();
+                    if !r.is_empty() && !c.remotes.contains(&r) {
+                        c.remotes.push(r);
+                    }
+                }
                 _ => {}
             }
         }
@@ -101,6 +110,10 @@ impl Config {
             self.max_fps,
             self.audio,
         );
+        let mut body = body;
+        for r in &self.remotes {
+            body.push_str(&format!("remote={r}\n"));
+        }
         let _ = std::fs::write(config_path(), body);
     }
 }

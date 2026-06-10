@@ -32,6 +32,11 @@ enum Command {
     Gui(MirrorArgs),
     /// Launch the GUI preconfigured (and auto-connect) with these options.
     Mirror(MirrorArgs),
+    /// `adb connect` a Quest over the network (ip or ip:port).
+    Connect {
+        /// Address, e.g. 192.168.1.40 or 192.168.1.40:5555.
+        addr: String,
+    },
     /// List connected adb devices.
     List,
     /// List the displays of a device.
@@ -133,6 +138,11 @@ fn main() -> Result<()> {
         None => run_gui(MirrorArgs::default(), false),
         Some(Command::Gui(args)) => run_gui(args, false),
         Some(Command::Mirror(args)) => run_gui(args, true),
+        Some(Command::Connect { addr }) => {
+            let msg = adb::connect(&addr)?;
+            println!("{msg}");
+            Ok(())
+        }
         Some(Command::List) => {
             let devices = adb::list_devices()?;
             if devices.is_empty() {
