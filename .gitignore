@@ -1,0 +1,17 @@
+# Rust build output
+/target
+
+# Runtime captures + saved settings
+/captures
+quest-scrcpy.cfg
+
+# Local test / diagnostic artifacts
+*.mp4
+*.png
+*_log.txt
+server_log.txt
+diag_shot.png
+undist_preview*.png
+
+# Allow the embedded server jar (required for the build)
+!assets/**
