@@ -20,7 +20,7 @@ pub enum AacPlayer {
 
 impl AacPlayer {
     pub fn new() -> Result<Self> {
-        if crate::ffmpeg::available() {
+        if crate::ffmpeg::use_for_playback() {
             return Ok(Self::Ffmpeg(ffmpeg::FfmpegPlayer::new()?));
         }
         #[cfg(windows)]

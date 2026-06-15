@@ -4,6 +4,10 @@
 # Staged release binaries (uploaded to GitHub releases, not tracked in git)
 quest-scrcpy-v*.exe
 
+# Python helper bytecode
+__pycache__/
+*.pyc
+
 # Runtime captures + saved settings
 /captures
 quest-scrcpy.cfg

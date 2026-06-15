@@ -22,7 +22,7 @@ pub enum Recorder {
 impl Recorder {
     /// `config` is the Annex-B SPS/PPS from the stream's config packet (MF only).
     pub fn new(path: &Path, width: u32, height: u32, fps_hint: u32, config: &[u8]) -> Result<Self> {
-        if crate::ffmpeg::available() {
+        if crate::ffmpeg::use_for_recording() {
             return Ok(Self::Ffmpeg(ffmpeg::FfmpegMux::new(path, fps_hint)?));
         }
         #[cfg(windows)]
@@ -61,7 +61,7 @@ pub enum ClipEncoder {
 
 impl ClipEncoder {
     pub fn new(path: &Path, width: u32, height: u32, fps_hint: u32, bitrate: u32) -> Result<Self> {
-        if crate::ffmpeg::available() {
+        if crate::ffmpeg::use_for_recording() {
             return Ok(Self::Ffmpeg(ffmpeg::FfmpegEncoder::new(
                 path, width, height, fps_hint, bitrate,
             )?));

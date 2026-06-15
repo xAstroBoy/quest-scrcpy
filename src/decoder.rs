@@ -29,7 +29,7 @@ pub enum H264Decoder {
 impl H264Decoder {
     /// `expect_w`/`expect_h` is the declared display size; output is pinned to it.
     pub fn new(expect_w: u32, expect_h: u32) -> Result<Self> {
-        if crate::ffmpeg::available() {
+        if crate::ffmpeg::use_for_playback() {
             return Ok(Self::Ffmpeg(ffmpeg::FfmpegDecoder::new(expect_w, expect_h)?));
         }
         #[cfg(windows)]

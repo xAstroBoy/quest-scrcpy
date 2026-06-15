@@ -26,14 +26,14 @@ impl FfmpegDecoder {
         let height = height.max(1);
 
         let mut cmd = crate::ffmpeg::command().ok_or_else(|| anyhow!("ffmpeg not available"))?;
-        // Raw RGBA out at a fixed size. Minimal probing so the FIRST frame comes
-        // out fast and — crucially — regardless of bitrate: a larger probesize
-        // means ffmpeg buffers that many bytes before find_stream_info finishes,
-        // which on a low-bitrate (mostly static) view can take many seconds and
-        // looks like "0 fps". Over a non-seekable pipe ffmpeg keeps reading until
-        // it can decode, so a tiny probesize is safe; the stream has no B-frames
-        // so each frame is emitted as soon as it's decoded.
-        cmd.args(["-probesize", "32", "-analyzeduration", "0"])
+        // Raw RGBA out at a fixed size. A tiny probesize keeps startup fast and
+        // bitrate-independent (a large one makes find_stream_info buffer that
+        // many bytes first — seconds on a near-static view, i.e. "0 fps"). On a
+        // non-seekable pipe probesize is a soft floor: ffmpeg still reads enough
+        // to get SPS/PPS, so the decoder initialises properly. We do NOT set
+        // `-analyzeduration 0` — that forces stream-info to finish immediately
+        // and can leave the decoder mis-initialised (one frame, then stalls).
+        cmd.args(["-probesize", "32"])
             .args(["-f", "h264", "-i", "pipe:0"])
             .args(["-an", "-f", "rawvideo", "-pix_fmt", "rgba"])
             .args(["-s", &format!("{width}x{height}")])

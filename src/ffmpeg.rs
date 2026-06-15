@@ -56,6 +56,36 @@ pub fn available() -> bool {
     path().is_some()
 }
 
+/// `$QUEST_SCRCPY_FORCE_FFMPEG` opts Windows into the ffmpeg live path.
+fn forced() -> bool {
+    std::env::var_os("QUEST_SCRCPY_FORCE_FFMPEG").is_some()
+}
+
+/// Use ffmpeg for LIVE decode + audio playback?
+///
+/// On Windows we default to the native Media Foundation codecs: they are
+/// proven, dependency-free, and the ffmpeg pipe path has shown live-decode
+/// stalls on some devices. ffmpeg is opt-in there via `$QUEST_SCRCPY_FORCE_FFMPEG`.
+/// On Linux/macOS ffmpeg is the only backend, so use it whenever present.
+pub fn use_for_playback() -> bool {
+    #[cfg(windows)]
+    {
+        forced() && available()
+    }
+    #[cfg(not(windows))]
+    {
+        available()
+    }
+}
+
+/// Use ffmpeg for RECORDING? Preferred whenever available — it muxes audio into
+/// the clip and is cross-platform; the MF recorder (video-only) is the fallback.
+/// Recording feeds an ffmpeg process that writes to a file (no read-back pipe),
+/// so it doesn't share the live-decode stall risk.
+pub fn use_for_recording() -> bool {
+    available()
+}
+
 /// Start an ffmpeg command with quiet logging and no console-window flash.
 /// `None` if ffmpeg isn't available.
 pub fn command() -> Option<Command> {
