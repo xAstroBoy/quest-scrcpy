@@ -1,6 +1,9 @@
 # Rust build output
 /target
 
+# Staged release binaries (uploaded to GitHub releases, not tracked in git)
+quest-scrcpy-v*.exe
+
 # Runtime captures + saved settings
 /captures
 quest-scrcpy.cfg

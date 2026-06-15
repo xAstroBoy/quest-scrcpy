@@ -7,8 +7,10 @@
 
 use crate::adb;
 use crate::decoder::{Frame, H264Decoder};
+use crate::recorder::ClipEncoder;
 use crate::stream::{FrameSlot, Status};
 use anyhow::{Context, Result, anyhow, bail};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -16,6 +18,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// GUI -> flat-thread recording commands.
+enum FlatRec {
+    Start(PathBuf),
+    Stop,
+}
+
+/// RGBA (decoder output) -> BGRA (what [`ClipEncoder`] wants).
+fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; rgba.len()];
+    for (i, px) in rgba.chunks_exact(4).enumerate() {
+        let o = i * 4;
+        out[o] = px[2];
+        out[o + 1] = px[1];
+        out[o + 2] = px[0];
+        out[o + 3] = 255;
+    }
+    out
+}
 
 /// The on-device agent, baked into the binary (built from `agent/` — see
 /// `agent/src/com/questflat/FlatStream.java`). Pushed and run like scrcpy's jar.
@@ -180,6 +201,8 @@ pub struct FlatHandle {
     child: Arc<Mutex<Option<Child>>>,
     pub slot: Arc<Mutex<FrameSlot>>,
     pub status: Arc<Mutex<Status>>,
+    record_tx: Sender<FlatRec>,
+    recording: Arc<AtomicBool>,
 }
 
 impl FlatHandle {
@@ -195,19 +218,31 @@ impl FlatHandle {
         let slot = Arc::new(Mutex::new(FrameSlot::default()));
         let status = Arc::new(Mutex::new(Status::Connecting));
         let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+        let recording = Arc::new(AtomicBool::new(false));
+        let (record_tx, record_rx) = unbounded();
 
         let join = {
-            let (stop, slot, status, child, serial) =
-                (stop.clone(), slot.clone(), status.clone(), child.clone(), serial.clone());
+            let (stop, slot, status, child, serial, recording) = (
+                stop.clone(),
+                slot.clone(),
+                status.clone(),
+                child.clone(),
+                serial.clone(),
+                recording.clone(),
+            );
             std::thread::Builder::new()
                 .name("flat-stream".into())
                 .spawn(move || {
-                    if let Err(e) = run_gui(&serial, w, h, bitrate, fps, &stop, &slot, &status, &child, &repaint) {
+                    if let Err(e) = run_gui(
+                        &serial, w, h, bitrate, fps, &stop, &slot, &status, &child, &recording,
+                        &record_rx, &repaint,
+                    ) {
                         if !stop.load(Ordering::Relaxed) {
                             *status.lock().unwrap() = Status::Error(format!("{e:#}"));
                             repaint.request_repaint();
                         }
                     }
+                    recording.store(false, Ordering::Relaxed);
                     if let Some(c) = child.lock().unwrap().as_mut() {
                         let _ = c.kill();
                     }
@@ -218,11 +253,23 @@ impl FlatHandle {
                 .expect("spawn flat thread")
         };
 
-        Self { stop, join: Some(join), child, slot, status }
+        Self { stop, join: Some(join), child, slot, status, record_tx, recording }
     }
 
     pub fn status(&self) -> Status {
         self.status.lock().unwrap().clone()
+    }
+
+    pub fn is_recording(&self) -> bool {
+        self.recording.load(Ordering::Relaxed)
+    }
+
+    pub fn start_recording(&self, path: PathBuf) {
+        let _ = self.record_tx.send(FlatRec::Start(path));
+    }
+
+    pub fn stop_recording(&self) {
+        let _ = self.record_tx.send(FlatRec::Stop);
     }
 
     fn signal_stop(&self) {
@@ -254,6 +301,8 @@ fn run_gui(
     slot: &Arc<Mutex<FrameSlot>>,
     status: &Arc<Mutex<Status>>,
     child_slot: &Arc<Mutex<Option<Child>>>,
+    recording: &Arc<AtomicBool>,
+    record_rx: &Receiver<FlatRec>,
     repaint: &egui::Context,
 ) -> Result<()> {
     push_agent(serial)?;
@@ -270,9 +319,35 @@ fn run_gui(
     // Audio plays through the same AAC player the scrcpy path uses; created
     // lazily on the first audio packet (the agent sends config first).
     let mut audio: Option<crate::audioplay::AacPlayer> = None;
+    // Recording: the flat frames are already what's on screen, so just re-encode
+    // them (RGBA->BGRA) to MP4. Created on the first frame after a Start command.
+    let mut clip: Option<ClipEncoder> = None;
+    let mut pending_record: Option<PathBuf> = None;
+    let mut rec_start = Instant::now();
     let mut frames_since = 0u32;
     let mut last_tick = Instant::now();
     while !stop.load(Ordering::Relaxed) {
+        while let Ok(cmd) = record_rx.try_recv() {
+            match cmd {
+                FlatRec::Start(path) => {
+                    if let Some(c) = clip.take() {
+                        let _ = c.finalize();
+                    }
+                    pending_record = Some(path);
+                }
+                FlatRec::Stop => {
+                    pending_record = None;
+                    if let Some(c) = clip.take() {
+                        match c.finalize() {
+                            Ok(()) => eprintln!("[flat] recording saved"),
+                            Err(e) => eprintln!("[flat] finalize error: {e:#}"),
+                        }
+                    }
+                    recording.store(false, Ordering::Relaxed);
+                }
+            }
+        }
+
         let (kind, data) = match read_packet(&mut stdout) {
             Ok(Some(p)) => p,
             Ok(None) => break,
@@ -299,6 +374,30 @@ fn run_gui(
         }
         for frame in dec.decode(&data)? {
             let (fw, fh) = (frame.width, frame.height);
+
+            // Start a pending recording now that we know the frame size.
+            if let Some(path) = pending_record.take() {
+                match ClipEncoder::new(&path, fw, fh, fps, bitrate) {
+                    Ok(c) => {
+                        clip = Some(c);
+                        rec_start = Instant::now();
+                        recording.store(true, Ordering::Relaxed);
+                        eprintln!("[flat] recording -> {} ({fw}x{fh})", path.display());
+                    }
+                    Err(e) => eprintln!("[flat] record start failed: {e:#}"),
+                }
+            }
+            if let Some(enc) = clip.as_mut() {
+                let bgra = rgba_to_bgra(&frame.rgba);
+                if let Err(e) = enc.write_bgra(&bgra, rec_start.elapsed().as_micros() as u64) {
+                    eprintln!("[flat] record write error: {e:#}");
+                    if let Some(c) = clip.take() {
+                        let _ = c.finalize();
+                    }
+                    recording.store(false, Ordering::Relaxed);
+                }
+            }
+
             {
                 let mut s = slot.lock().unwrap();
                 s.frame = Some(frame);
@@ -314,5 +413,9 @@ fn run_gui(
             }
         }
     }
+    if let Some(c) = clip.take() {
+        let _ = c.finalize();
+    }
+    recording.store(false, Ordering::Relaxed);
     Ok(())
 }

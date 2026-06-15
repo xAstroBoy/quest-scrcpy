@@ -426,27 +426,34 @@ impl App {
 
     /// Toggle clip recording on the active stream.
     fn toggle_recording(&mut self) {
-        let recording = self.stream.as_ref().map(|s| s.is_recording()).unwrap_or(false);
-        if self.stream.is_none() {
+        let recording = self.stream.as_ref().map(|s| s.is_recording()).unwrap_or(false)
+            || self.flat.as_ref().map(|f| f.is_recording()).unwrap_or(false);
+        if self.stream.is_none() && self.flat.is_none() {
             return;
         }
         if recording {
             if let Some(s) = &self.stream {
                 s.stop_recording();
             }
+            if let Some(f) = &self.flat {
+                f.stop_recording();
+            }
             self.capture_msg = Some("⏹ Recording saved.".into());
         } else {
-            // Capture exactly what's on screen: current crop + lens + tilt.
-            let view = ViewParams {
-                uv: [self.uv.min.x, self.uv.min.y, self.uv.max.x, self.uv.max.y],
-                lens_correct: self.lens_correct,
-                k1: self.lens_k1,
-                k2: self.lens_k2,
-                rotation_deg: self.rotation_deg,
-            };
             match capture_path("clip", "mp4") {
                 Ok(path) => {
-                    if let Some(s) = &self.stream {
+                    if let Some(f) = &self.flat {
+                        // The flat view is already what's on screen — record as-is.
+                        f.start_recording(path.clone());
+                    } else if let Some(s) = &self.stream {
+                        // Capture exactly what's on screen: current crop + lens + tilt.
+                        let view = ViewParams {
+                            uv: [self.uv.min.x, self.uv.min.y, self.uv.max.x, self.uv.max.y],
+                            lens_correct: self.lens_correct,
+                            k1: self.lens_k1,
+                            k2: self.lens_k2,
+                            rotation_deg: self.rotation_deg,
+                        };
                         s.start_recording(path.clone(), view);
                     }
                     self.capture_msg = Some(format!("⏺ Recording to {}", path.display()));
@@ -760,8 +767,8 @@ impl App {
                 ui.separator();
                 self.status_label(ui);
 
-                // Capture controls (only meaningful with a live stream).
-                if self.stream.is_some() {
+                // Capture controls — work for either source (panel or flat view).
+                if self.stream.is_some() || self.flat.is_some() {
                     ui.separator();
                     let can_shoot = self.texture.is_some();
                     if ui
@@ -771,8 +778,8 @@ impl App {
                     {
                         self.take_screenshot();
                     }
-                    let recording =
-                        self.stream.as_ref().map(|s| s.is_recording()).unwrap_or(false);
+                    let recording = self.stream.as_ref().map(|s| s.is_recording()).unwrap_or(false)
+                        || self.flat.as_ref().map(|f| f.is_recording()).unwrap_or(false);
                     let (label, color) = if recording {
                         ("⏹ Stop", Color32::from_rgb(0xff, 0x6b, 0x6b))
                     } else {
