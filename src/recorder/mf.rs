@@ -214,6 +214,11 @@ impl ClipEncoder {
         (self.width, self.height)
     }
 
+    /// The MF sink-writer path is video-only; audio is dropped (the ffmpeg
+    /// backend muxes it). These keep the dispatcher API uniform.
+    pub fn set_audio_config(&mut self, _asc: &[u8]) {}
+    pub fn write_audio(&mut self, _au: &[u8]) {}
+
     /// `bgra` must be `width*height*4` bytes (B,G,R,X), top-down.
     pub fn write_bgra(&mut self, bgra: &[u8], pts_us: u64) -> Result<()> {
         let need = (self.width * self.height * 4) as usize;

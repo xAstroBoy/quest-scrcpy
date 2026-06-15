@@ -26,12 +26,14 @@ impl FfmpegDecoder {
         let height = height.max(1);
 
         let mut cmd = crate::ffmpeg::command().ok_or_else(|| anyhow!("ffmpeg not available"))?;
-        // Raw RGBA out at a fixed size. A modest probesize bounds startup
-        // latency without starving the decoder of SPS/PPS. We deliberately do
-        // NOT set `-flags low_delay`/`-fflags nobuffer`: over a pipe they make
-        // the decoder emit nothing here, and the stream has no B-frames so the
-        // default already returns each frame as soon as it's decoded.
-        cmd.args(["-probesize", "500000"])
+        // Raw RGBA out at a fixed size. Minimal probing so the FIRST frame comes
+        // out fast and — crucially — regardless of bitrate: a larger probesize
+        // means ffmpeg buffers that many bytes before find_stream_info finishes,
+        // which on a low-bitrate (mostly static) view can take many seconds and
+        // looks like "0 fps". Over a non-seekable pipe ffmpeg keeps reading until
+        // it can decode, so a tiny probesize is safe; the stream has no B-frames
+        // so each frame is emitted as soon as it's decoded.
+        cmd.args(["-probesize", "32", "-analyzeduration", "0"])
             .args(["-f", "h264", "-i", "pipe:0"])
             .args(["-an", "-f", "rawvideo", "-pix_fmt", "rgba"])
             .args(["-s", &format!("{width}x{height}")])
@@ -148,6 +150,47 @@ mod tests {
         frames += dec.decode(&[]).expect("drain").len();
 
         assert!(frames > 0, "expected at least one decoded frame, got {frames}");
+        let _ = std::fs::remove_file(&h264);
+    }
+
+    /// The real (live) shape: feed access units incrementally and NEVER close
+    /// the pipe — frames must flow without an EOF flush. This is what the GUI
+    /// does; the 0-fps bug was that ffmpeg buffered everything until EOF.
+    #[test]
+    fn decodes_streaming_without_eof() {
+        if !crate::ffmpeg::available() {
+            eprintln!("ffmpeg not on PATH; skipping live-stream decode");
+            return;
+        }
+        let (w, h) = (1280u32, 720u32);
+        let h264 = std::env::temp_dir().join("qs_ff_live_test.h264");
+        let _ = std::fs::remove_file(&h264);
+        let status = crate::ffmpeg::command()
+            .unwrap()
+            .args(["-f", "lavfi", "-i", &format!("testsrc=size={w}x{h}:rate=30"), "-t", "3"])
+            .args(["-c:v", "libx264", "-g", "30", "-pix_fmt", "yuv420p", "-f", "h264"])
+            .arg("-y")
+            .arg(&h264)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success(), "ffmpeg failed to make test clip");
+
+        let data = std::fs::read(&h264).expect("read h264");
+        let mut dec = FfmpegDecoder::new(w, h).expect("decoder");
+        let mut frames = 0usize;
+        // Feed in small chunks with a little pacing, like a live capture. Do NOT
+        // close the input — frames must arrive anyway.
+        for chunk in data.chunks(8192) {
+            frames += dec.decode(chunk).expect("decode").len();
+            std::thread::sleep(std::time::Duration::from_millis(3));
+        }
+        // Drain what's decoded so far (still no EOF).
+        for _ in 0..20 {
+            frames += dec.decode(&[]).expect("decode").len();
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+
+        assert!(frames > 0, "live decode produced 0 frames without EOF (the 0-fps bug)");
         let _ = std::fs::remove_file(&h264);
     }
 }

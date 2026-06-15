@@ -323,6 +323,9 @@ fn run_gui(
     // them (RGBA->BGRA) to MP4. Created on the first frame after a Start command.
     let mut clip: Option<ClipEncoder> = None;
     let mut pending_record: Option<PathBuf> = None;
+    // The AAC config (sent once at stream start) so a recording started later
+    // can still mux audio.
+    let mut audio_config: Option<Vec<u8>> = None;
     let mut rec_start = Instant::now();
     let mut frames_since = 0u32;
     let mut last_tick = Instant::now();
@@ -360,6 +363,17 @@ fn run_gui(
         };
         if kind != 0 {
             // 1 = AAC frame, 2 = AAC codec config.
+            if kind == 2 {
+                audio_config = Some(data.clone());
+            }
+            // Mux audio into an active recording (config first, then frames).
+            if let Some(enc) = clip.as_mut() {
+                if kind == 2 {
+                    enc.set_audio_config(&data);
+                } else {
+                    enc.write_audio(&data);
+                }
+            }
             if audio.is_none() {
                 audio = crate::audioplay::AacPlayer::new()
                     .map_err(|e| eprintln!("[flat] audio init failed: {e:#}"))
@@ -378,7 +392,11 @@ fn run_gui(
             // Start a pending recording now that we know the frame size.
             if let Some(path) = pending_record.take() {
                 match ClipEncoder::new(&path, fw, fh, fps, bitrate) {
-                    Ok(c) => {
+                    Ok(mut c) => {
+                        // Carry the AAC config so the recording gets an audio track.
+                        if let Some(asc) = audio_config.as_ref() {
+                            c.set_audio_config(asc);
+                        }
                         clip = Some(c);
                         rec_start = Instant::now();
                         recording.store(true, Ordering::Relaxed);

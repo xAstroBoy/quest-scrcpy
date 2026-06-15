@@ -82,6 +82,25 @@ impl ClipEncoder {
         }
     }
 
+    /// Start capturing audio into the recording (AudioSpecificConfig). Only the
+    /// ffmpeg backend muxes audio; MF is video-only.
+    pub fn set_audio_config(&mut self, asc: &[u8]) {
+        match self {
+            Self::Ffmpeg(e) => e.set_audio_config(asc),
+            #[cfg(windows)]
+            Self::Mf(e) => e.set_audio_config(asc),
+        }
+    }
+
+    /// Append one raw AAC access unit to the recording's audio track.
+    pub fn write_audio(&mut self, au: &[u8]) {
+        match self {
+            Self::Ffmpeg(e) => e.write_audio(au),
+            #[cfg(windows)]
+            Self::Mf(e) => e.write_audio(au),
+        }
+    }
+
     pub fn write_bgra(&mut self, bgra: &[u8], pts_us: u64) -> Result<()> {
         match self {
             Self::Ffmpeg(e) => e.write_bgra(bgra, pts_us),

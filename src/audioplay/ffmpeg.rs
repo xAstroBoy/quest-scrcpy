@@ -24,14 +24,7 @@ pub struct FfmpegPlayer {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     /// ADTS header fields parsed from the AudioSpecificConfig.
-    adts: Option<AdtsParams>,
-}
-
-#[derive(Clone, Copy)]
-struct AdtsParams {
-    profile: u8,   // ADTS 2-bit profile = audioObjectType - 1
-    freq_idx: u8,  // sampling frequency index (4 bits)
-    channels: u8,  // channel configuration (3 bits in ADTS)
+    adts: Option<crate::ffmpeg::Adts>,
 }
 
 impl FfmpegPlayer {
@@ -104,7 +97,7 @@ impl FfmpegPlayer {
 
     pub fn feed(&mut self, data: &[u8], is_config: bool) -> Result<()> {
         if is_config {
-            self.adts = Some(parse_asc(data));
+            self.adts = Some(crate::ffmpeg::Adts::from_asc(data));
             self.spawn_decoder()?;
             return Ok(());
         }
@@ -191,36 +184,6 @@ impl Drop for FfmpegPlayer {
             let _ = c.kill();
             let _ = c.wait();
         }
-    }
-}
-
-impl AdtsParams {
-    fn header(&self, payload_len: usize) -> [u8; 7] {
-        let frame_len = (7 + payload_len) as u32;
-        let mut h = [0u8; 7];
-        h[0] = 0xFF;
-        h[1] = 0xF1; // syncword + MPEG-4 + Layer 0 + no CRC
-        h[2] = (self.profile << 6) | ((self.freq_idx & 0x0F) << 2) | ((self.channels >> 2) & 0x01);
-        h[3] = ((self.channels & 0x03) << 6) | (((frame_len >> 11) & 0x03) as u8);
-        h[4] = ((frame_len >> 3) & 0xFF) as u8;
-        h[5] = (((frame_len & 0x07) << 5) as u8) | 0x1F;
-        h[6] = 0xFC;
-        h
-    }
-}
-
-/// Parse the bits of an AudioSpecificConfig we need for an ADTS header.
-fn parse_asc(asc: &[u8]) -> AdtsParams {
-    if asc.len() < 2 {
-        return AdtsParams { profile: 1, freq_idx: 4, channels: 2 }; // AAC-LC, 44.1k, stereo
-    }
-    let obj = (asc[0] >> 3) & 0x1F;
-    let freq_idx = (((asc[0] & 0x07) << 1) | (asc[1] >> 7)) & 0x0F;
-    let chan = (asc[1] >> 3) & 0x0F;
-    AdtsParams {
-        profile: obj.saturating_sub(1) & 0x03,
-        freq_idx,
-        channels: chan.clamp(1, 7),
     }
 }
 
