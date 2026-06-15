@@ -1,6 +1,7 @@
 package com.questflat;
 
 import android.content.Context;
+import android.content.pm.ApplicationInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioPlaybackCaptureConfiguration;
@@ -215,25 +216,35 @@ public class FlatStream {
         Thread t = new Thread(new Runnable() {
             public void run() {
                 final int SR = 48000;
+                // ActivityThread's constructor builds a Handler, which needs a
+                // Looper on this thread.
+                try { Looper.prepare(); } catch (Throwable ignore) {}
                 try {
+                    // scrcpy's secret sauce: as the shell uid the AudioRecord
+                    // permission/package lookup goes through ActivityThread's app
+                    // info, which is empty here — so capture silently yields no
+                    // PCM. Fake it to "com.android.shell" first (Workarounds.fillAppInfo).
+                    fillAppInfo();
+
                     int minBuf = AudioRecord.getMinBufferSize(
                             SR, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
                     int bufSize = Math.max(minBuf, 16384);
 
-                    AudioRecord rec = openPlaybackCapture(mp, SR, bufSize);
-                    if (rec == null || rec.getState() != AudioRecord.STATE_INITIALIZED) {
-                        // Fall back to REMOTE_SUBMIX (the output mix) if playback
-                        // capture isn't available for this projection.
-                        log("audio: playback-capture unavailable, trying REMOTE_SUBMIX");
-                        rec = new AudioRecord(
-                                MediaRecorder.AudioSource.REMOTE_SUBMIX, SR,
-                                AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+                    // Try each source and keep whichever actually reaches the
+                    // RECORDING state. AudioPlaybackCapture is tied to our
+                    // projection (most likely to start as shell); REMOTE_SUBMIX is
+                    // scrcpy's default fallback.
+                    AudioRecord rec = startCapture(openPlaybackCapture(mp, SR, bufSize));
+                    String which = "AudioPlaybackCapture";
+                    if (rec == null) {
+                        rec = startCapture(openRemoteSubmix(SR, bufSize));
+                        which = "REMOTE_SUBMIX";
                     }
-                    if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
-                        log("audio: no source initialized — video only");
+                    if (rec == null) {
+                        log("audio: no source could start recording — video only");
                         return;
                     }
-                    rec.startRecording();
+                    log("audio: capturing via " + which);
 
                     MediaFormat af = MediaFormat.createAudioFormat("audio/mp4a-latm", SR, 2);
                     af.setInteger(MediaFormat.KEY_AAC_PROFILE,
@@ -324,6 +335,105 @@ public class FlatStream {
         } catch (Throwable e) {
             log("audio: AudioPlaybackCapture init failed: " + e);
             return null;
+        }
+    }
+
+    /// REMOTE_SUBMIX (the device output mix) — scrcpy's default audio source.
+    static AudioRecord openRemoteSubmix(int sr, int bufSize) {
+        try {
+            AudioFormat fmt = new AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sr)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                    .build();
+            AudioRecord rec = new AudioRecord.Builder()
+                    .setAudioSource(MediaRecorder.AudioSource.REMOTE_SUBMIX)
+                    .setAudioFormat(fmt)
+                    .setBufferSizeInBytes(bufSize)
+                    .build();
+            log("audio: REMOTE_SUBMIX initialized (state=" + rec.getState() + ")");
+            return rec;
+        } catch (Throwable e) {
+            log("audio: REMOTE_SUBMIX init failed: " + e);
+            return null;
+        }
+    }
+
+    /// Start a candidate recorder; return it only if it actually reaches the
+    /// RECORDING state, else release it and return null (so the caller can try
+    /// the next source).
+    static AudioRecord startCapture(AudioRecord rec) {
+        if (rec == null || rec.getState() != AudioRecord.STATE_INITIALIZED) {
+            if (rec != null) {
+                try { rec.release(); } catch (Throwable ignore) {}
+            }
+            return null;
+        }
+        try {
+            startRecordingRetry(rec);
+        } catch (Throwable e) {
+            log("audio: startRecording threw: " + e);
+        }
+        if (rec.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+            return rec;
+        }
+        try { rec.release(); } catch (Throwable ignore) {}
+        return null;
+    }
+
+    /// scrcpy retries startRecording() until the recorder actually reaches the
+    /// RECORDING state (it can silently stay STOPPED the first time as shell).
+    static void startRecordingRetry(AudioRecord rec) throws InterruptedException {
+        rec.startRecording();
+        int tries = 0;
+        while (rec.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING && tries < 5) {
+            log("audio: not recording yet (state=" + rec.getRecordingState() + "), retry " + tries);
+            try { rec.stop(); } catch (Throwable ignore) {}
+            Thread.sleep(50);
+            rec.startRecording();
+            tries++;
+        }
+        log("audio: recordingState=" + rec.getRecordingState());
+    }
+
+    /// scrcpy's Workarounds: create a FRESH plain ActivityThread (not systemMain's
+    /// system thread), register it as the current one, and give it a fake
+    /// "com.android.shell" bound application. AudioRecord derives its package /
+    /// attribution from the current ActivityThread, and only a shell-attributed
+    /// one is allowed by the audio policy to start REMOTE_SUBMIX/playback capture.
+    /// The video path is already set up by the time audio runs, so swapping the
+    /// current ActivityThread here doesn't disturb it.
+    static void fillAppInfo() {
+        try {
+            Class<?> atC = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Constructor<?> atCtor = atC.getDeclaredConstructor();
+            atCtor.setAccessible(true);
+            Object at = atCtor.newInstance();
+
+            java.lang.reflect.Field sCur = atC.getDeclaredField("sCurrentActivityThread");
+            sCur.setAccessible(true);
+            sCur.set(null, at);
+
+            Class<?> abdC = Class.forName("android.app.ActivityThread$AppBindData");
+            java.lang.reflect.Constructor<?> abdCtor = abdC.getDeclaredConstructor();
+            abdCtor.setAccessible(true);
+            Object appBindData = abdCtor.newInstance();
+
+            ApplicationInfo ai = new ApplicationInfo();
+            ai.packageName = "com.android.shell";
+            java.lang.reflect.Field appInfoF = abdC.getDeclaredField("appInfo");
+            appInfoF.setAccessible(true);
+            appInfoF.set(appBindData, ai);
+
+            java.lang.reflect.Field mBoundAppF = atC.getDeclaredField("mBoundApplication");
+            mBoundAppF.setAccessible(true);
+            mBoundAppF.set(at, appBindData);
+            log("audio: fillAppInfo (fresh ActivityThread, com.android.shell)");
+        } catch (Throwable e) {
+            Throwable c = (e instanceof java.lang.reflect.InvocationTargetException && e.getCause() != null)
+                    ? e.getCause() : e;
+            log("audio: fillAppInfo failed: " + c);
+            Log.e(TAG, "fillAppInfo cause", c);
         }
     }
 }

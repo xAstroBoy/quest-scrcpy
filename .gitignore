@@ -8,6 +8,9 @@ quest-scrcpy-v*.exe
 __pycache__/
 *.pyc
 
+# Scratch (commit-message / release-note temp files)
+*.tmp
+
 # Runtime captures + saved settings
 /captures
 quest-scrcpy.cfg
