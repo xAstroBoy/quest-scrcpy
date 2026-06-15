@@ -78,6 +78,33 @@ public class FlatStream {
                 .invoke(ext, new Object[]{null});
         log("mediaProjection=" + mp);
 
+        // Match the capture to the real flat-view aspect ratio, fit inside the
+        // requested WxH *box*. AUTO_MIRROR scales the source to fit our virtual
+        // display preserving aspect, so a frame that isn't the source's shape
+        // gets letterboxed (looks "cropped"/not maximized). Sizing the frame to
+        // the source aspect makes the view fill it. Falls back to the requested
+        // size if the query fails.
+        try {
+            Object dmgEarly = Class.forName("android.hardware.display.DisplayManagerGlobal")
+                    .getMethod("getInstance").invoke(null);
+            Object di = dmgEarly.getClass().getMethod("getDisplayInfo", int.class)
+                    .invoke(dmgEarly, 0 /* Display.DEFAULT_DISPLAY */);
+            int lw = di.getClass().getField("logicalWidth").getInt(di);
+            int lh = di.getClass().getField("logicalHeight").getInt(di);
+            if (lw > 0 && lh > 0) {
+                double scale = Math.min((double) W / lw, (double) H / lh);
+                int ow = ((int) Math.round(lw * scale)) & ~1;
+                int oh = ((int) Math.round(lh * scale)) & ~1;
+                if (ow >= 2 && oh >= 2) {
+                    log("source display " + lw + "x" + lh + " -> capture " + ow + "x" + oh);
+                    W = ow;
+                    H = oh;
+                }
+            }
+        } catch (Throwable t) {
+            log("display-size query failed, using requested " + W + "x" + H + ": " + t);
+        }
+
         // --- H.264 encoder fed by a Surface ---
         MediaFormat fmt = MediaFormat.createVideoFormat("video/avc", W, H);
         fmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);

@@ -297,10 +297,12 @@ impl App {
         self.lens_correct = false;
         self.rotation_deg = 0.0;
         self.uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-        // Resolution / bitrate / fps from the quality knobs: Max size = width
-        // (16:9), so 1920→1080p, 2560→1440p, 3840→2160p; "Full panel" → 1080p.
+        // Resolution / bitrate / fps from the quality knobs. We pass a *square*
+        // bounding box (max_size × max_size); the agent fits the real flat-view
+        // aspect inside it, so the longer side reaches max_size whatever the
+        // shape — no forced 16:9 that would letterbox/crop the view.
         let w = if self.settings.max_size >= 640 { self.settings.max_size } else { 1920 };
-        let h = (((w as u64 * 9) / 16) as u32) & !1;
+        let h = w;
         let bitrate = self.settings.bitrate_mbps.max(2) * 1_000_000;
         let fps = if self.settings.max_fps > 0 { self.settings.max_fps } else { 72 };
         self.flat = Some(crate::flat::FlatHandle::start(serial, w, h, bitrate, fps, ctx.clone()));

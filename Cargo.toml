@@ -1,6 +1,6 @@
 [package]
 name = "quest-scrcpy"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 description = "Native Rust scrcpy client tuned for the Meta Quest 3 (one-eye live crop)."
 
@@ -13,6 +13,10 @@ crossbeam-channel = "0.5.15"
 eframe = { version = "0.34.3", features = ["wgpu"] }
 egui = "0.34.3"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+# Media Foundation (decode/audio/record) is the Windows-only fallback backend;
+# the cross-platform path shells out to the ffmpeg CLI instead.
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_System_Com",

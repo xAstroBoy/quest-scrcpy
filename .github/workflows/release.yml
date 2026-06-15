@@ -9,23 +9,44 @@ permissions:
   contents: write
 
 jobs:
-  # Windows: the only platform that builds today (the decode stack uses Windows
-  # Media Foundation). Linux/macOS jobs get added once the decode/audio pipeline
-  # is ported to a cross-platform backend (openh264 + symphonia).
-  windows:
-    name: Windows x64
-    runs-on: windows-latest
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows x64
+            artifact: quest-scrcpy-${{ github.ref_name }}-windows-x64.exe
+            bin: target/release/quest-scrcpy.exe
+          - os: ubuntu-latest
+            label: Linux x64
+            artifact: quest-scrcpy-${{ github.ref_name }}-linux-x64
+            bin: target/release/quest-scrcpy
+          - os: macos-latest
+            label: macOS arm64
+            artifact: quest-scrcpy-${{ github.ref_name }}-macos-arm64
+            bin: target/release/quest-scrcpy
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # Linux: cpal links against ALSA at build time.
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev pkg-config
+
       - name: Build (release)
         run: cargo build --release
+
       - name: Stage artifact
-        shell: pwsh
-        run: Copy-Item target/release/quest-scrcpy.exe "quest-scrcpy-${{ github.ref_name }}-windows-x64.exe"
+        shell: bash
+        run: cp "${{ matrix.bin }}" "${{ matrix.artifact }}"
+
       - name: Publish to the GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: quest-scrcpy-*-windows-x64.exe
+          files: ${{ matrix.artifact }}
           generate_release_notes: true

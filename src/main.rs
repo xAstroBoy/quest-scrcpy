@@ -7,6 +7,7 @@ mod audio;
 mod audioplay;
 mod config;
 mod decoder;
+mod ffmpeg;
 mod flat;
 mod recorder;
 mod server;
