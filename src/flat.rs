@@ -25,6 +25,17 @@ enum FlatRec {
     Stop,
 }
 
+/// Append a diagnostic line to `quest-scrcpy-flat.log` (the release GUI has no
+/// console, so audio/stream issues need a file to land in). Best-effort.
+fn flat_log(msg: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("quest-scrcpy-flat.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{msg}");
+    }
+    eprintln!("[flat] {msg}");
+}
+
 /// RGBA (decoder output) -> BGRA (what [`ClipEncoder`] wants).
 fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; rgba.len()];
@@ -312,6 +323,10 @@ fn run_gui(
     *child_slot.lock().unwrap() = Some(child);
 
     let (w, h) = read_dims(&mut stdout)?;
+    flat_log(&format!(
+        "stream started {w}x{h}; ffmpeg_for_playback={}",
+        crate::ffmpeg::use_for_playback()
+    ));
     let mut dec = H264Decoder::new(w, h)?;
     *status.lock().unwrap() = Status::Streaming { width: w, height: h, fps: 0.0 };
     repaint.request_repaint();
@@ -319,6 +334,7 @@ fn run_gui(
     // Audio plays through the same AAC player the scrcpy path uses; created
     // lazily on the first audio packet (the agent sends config first).
     let mut audio: Option<crate::audioplay::AacPlayer> = None;
+    let mut audio_pkts = 0u64;
     // Recording: the flat frames are already what's on screen, so just re-encode
     // them (RGBA->BGRA) to MP4. Created on the first frame after a Start command.
     let mut clip: Option<ClipEncoder> = None;
@@ -363,8 +379,13 @@ fn run_gui(
         };
         if kind != 0 {
             // 1 = AAC frame, 2 = AAC codec config.
+            audio_pkts += 1;
+            if audio_pkts == 1 {
+                flat_log(&format!("first audio packet from agent (kind={kind}, {} bytes)", data.len()));
+            }
             if kind == 2 {
                 audio_config = Some(data.clone());
+                flat_log(&format!("AAC config received ({} bytes)", data.len()));
             }
             // Mux audio into an active recording (config first, then frames).
             if let Some(enc) = clip.as_mut() {
@@ -375,13 +396,17 @@ fn run_gui(
                 }
             }
             if audio.is_none() {
-                audio = crate::audioplay::AacPlayer::new()
-                    .map_err(|e| eprintln!("[flat] audio init failed: {e:#}"))
-                    .ok();
+                match crate::audioplay::AacPlayer::new() {
+                    Ok(p) => {
+                        flat_log("audio player created");
+                        audio = Some(p);
+                    }
+                    Err(e) => flat_log(&format!("audio init FAILED: {e:#}")),
+                }
             }
             if let Some(p) = audio.as_mut() {
                 if let Err(e) = p.feed(&data, kind == 2) {
-                    eprintln!("[flat] audio feed error: {e:#}");
+                    flat_log(&format!("audio feed error: {e:#}"));
                 }
             }
             continue;

@@ -1,7 +1,9 @@
 package com.questflat;
 
 import android.content.Context;
+import android.media.AudioAttributes;
 import android.media.AudioFormat;
+import android.media.AudioPlaybackCaptureConfiguration;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.hardware.display.VirtualDisplay;
@@ -165,7 +167,7 @@ public class FlatStream {
         out.writeInt(H);
         out.flush();
         log("streaming " + W + "x" + H + " to stdout");
-        startAudioCapture(out); // best-effort device audio -> AAC, interleaved
+        startAudioCapture(out, mp); // best-effort device audio -> AAC, interleaved
 
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         long frames = 0, bytes = 0;
@@ -209,22 +211,26 @@ public class FlatStream {
     /// Best-effort: capture the device's playback audio (via the same projection),
     /// encode AAC, and interleave it into the stdout stream as kind 1 (frame) /
     /// kind 2 (codec config). If anything fails, video keeps streaming.
-    static void startAudioCapture(final DataOutputStream out) {
+    static void startAudioCapture(final DataOutputStream out, final MediaProjection mp) {
         Thread t = new Thread(new Runnable() {
             public void run() {
                 final int SR = 48000;
-                log("audio: thread start (REMOTE_SUBMIX)");
                 try {
                     int minBuf = AudioRecord.getMinBufferSize(
                             SR, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
-                    // Shell holds CAPTURE_AUDIO_OUTPUT, so it can capture the output
-                    // mix via REMOTE_SUBMIX (the source scrcpy uses on this Quest).
-                    AudioRecord rec = new AudioRecord(
-                            MediaRecorder.AudioSource.REMOTE_SUBMIX, SR,
-                            AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT,
-                            Math.max(minBuf, 16384));
+                    int bufSize = Math.max(minBuf, 16384);
+
+                    AudioRecord rec = openPlaybackCapture(mp, SR, bufSize);
+                    if (rec == null || rec.getState() != AudioRecord.STATE_INITIALIZED) {
+                        // Fall back to REMOTE_SUBMIX (the output mix) if playback
+                        // capture isn't available for this projection.
+                        log("audio: playback-capture unavailable, trying REMOTE_SUBMIX");
+                        rec = new AudioRecord(
+                                MediaRecorder.AudioSource.REMOTE_SUBMIX, SR,
+                                AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+                    }
                     if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
-                        log("audio: REMOTE_SUBMIX not initialized — video only");
+                        log("audio: no source initialized — video only");
                         return;
                     }
                     rec.startRecording();
@@ -237,13 +243,20 @@ public class FlatStream {
                     MediaCodec aenc = MediaCodec.createEncoderByType("audio/mp4a-latm");
                     aenc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
                     aenc.start();
-                    log("audio: capturing 48kHz stereo -> AAC");
+                    log("audio: encoder started, reading PCM...");
 
                     byte[] pcm = new byte[4096];
                     MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+                    long reads = 0, pcmBytes = 0, aacFrames = 0;
                     while (running) {
                         int n = rec.read(pcm, 0, pcm.length);
                         if (n > 0) {
+                            pcmBytes += n;
+                            if (reads == 0) log("audio: first PCM read = " + n + " bytes");
+                            reads++;
+                            if ((reads & 255) == 0) {
+                                log("audio: reads=" + reads + " pcmBytes=" + pcmBytes + " aacFrames=" + aacFrames);
+                            }
                             int ii = aenc.dequeueInputBuffer(10_000);
                             if (ii >= 0) {
                                 ByteBuffer ib = aenc.getInputBuffer(ii);
@@ -251,6 +264,9 @@ public class FlatStream {
                                 ib.put(pcm, 0, n);
                                 aenc.queueInputBuffer(ii, 0, n, System.nanoTime() / 1000, 0);
                             }
+                        } else if (n < 0) {
+                            log("audio: read error " + n + " — stopping audio");
+                            break;
                         }
                         int oi;
                         while ((oi = aenc.dequeueOutputBuffer(info, 0)) >= 0) {
@@ -261,6 +277,7 @@ public class FlatStream {
                                 byte[] d = new byte[info.size];
                                 ob.get(d);
                                 int kind = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0 ? 2 : 1;
+                                if (kind == 1) aacFrames++;
                                 synchronized (out) {
                                     out.writeByte(kind);
                                     out.writeInt(d.length);
@@ -279,5 +296,34 @@ public class FlatStream {
         });
         t.setDaemon(true);
         t.start();
+    }
+
+    /// Build an AudioRecord that captures app PLAYBACK audio (media/game/unknown)
+    /// routed through the projection — the correct way to grab device sound.
+    /// Returns null if the platform/projection won't allow it (caller falls back).
+    static AudioRecord openPlaybackCapture(MediaProjection mp, int sr, int bufSize) {
+        try {
+            AudioPlaybackCaptureConfiguration apc =
+                    new AudioPlaybackCaptureConfiguration.Builder(mp)
+                            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                            .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                            .build();
+            AudioFormat fmt = new AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sr)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                    .build();
+            AudioRecord rec = new AudioRecord.Builder()
+                    .setAudioFormat(fmt)
+                    .setBufferSizeInBytes(bufSize)
+                    .setAudioPlaybackCaptureConfig(apc)
+                    .build();
+            log("audio: AudioPlaybackCapture initialized (state=" + rec.getState() + ")");
+            return rec;
+        } catch (Throwable e) {
+            log("audio: AudioPlaybackCapture init failed: " + e);
+            return null;
+        }
     }
 }

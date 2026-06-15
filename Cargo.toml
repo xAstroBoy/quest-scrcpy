@@ -1,6 +1,6 @@
 [package]
 name = "quest-scrcpy"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "Native Rust scrcpy client tuned for the Meta Quest 3 (one-eye live crop)."
 
