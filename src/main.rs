@@ -7,9 +7,11 @@ mod audio;
 mod audioplay;
 mod config;
 mod decoder;
+mod flat;
 mod recorder;
 mod server;
 mod stream;
+mod xrsp;
 
 use anyhow::{Result, anyhow};
 use app::StartupConfig;
@@ -44,6 +46,31 @@ enum Command {
         /// Device serial (defaults to the first/USB device).
         #[arg(short, long)]
         serial: Option<String>,
+    },
+    /// Stream the WHOLE flat Quest view (env + panels) and save a frame to PNG
+    /// headlessly — verifies the unrooted flat-capture agent end to end.
+    Flat {
+        /// Device serial (defaults to the first/USB device).
+        #[arg(short, long)]
+        serial: Option<String>,
+        /// Output .png path.
+        #[arg(short, long, default_value = "flat.png")]
+        output: String,
+        /// Seconds to stream before grabbing the latest frame.
+        #[arg(short = 'n', long, default_value_t = 4)]
+        seconds: u64,
+        /// Capture width (the flat view is composited at this resolution).
+        #[arg(short = 'W', long, default_value_t = 1920)]
+        width: u32,
+        /// Capture height.
+        #[arg(short = 'H', long, default_value_t = 1080)]
+        height: u32,
+        /// Video bitrate in Mbps.
+        #[arg(short, long, default_value_t = 20)]
+        bitrate: u32,
+        /// Frame-rate cap.
+        #[arg(short, long, default_value_t = 60)]
+        fps: u32,
     },
     /// Grab a single frame to PNG headlessly, then exit (diagnostic).
     Shot {
@@ -108,6 +135,21 @@ fn pick_serial(explicit: Option<String>) -> Result<String> {
         .ok_or_else(|| anyhow!("no online adb devices"))
 }
 
+/// Decode the embedded PNG into an egui window icon (taskbar / Alt-Tab / title
+/// bar). Baked into the binary so it works even in dev builds, where the .exe
+/// resource icon from build.rs isn't what the window manager shows.
+fn load_icon() -> eframe::egui::IconData {
+    const PNG: &[u8] = include_bytes!("../assets/icon-256.png");
+    match image::load_from_memory(PNG) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            let (width, height) = rgba.dimensions();
+            eframe::egui::IconData { rgba: rgba.into_raw(), width, height }
+        }
+        Err(_) => eframe::egui::IconData { rgba: Vec::new(), width: 0, height: 0 },
+    }
+}
+
 fn run_gui(args: MirrorArgs, autostart: bool) -> Result<()> {
     let startup = StartupConfig {
         serial: args.serial,
@@ -123,7 +165,8 @@ fn run_gui(args: MirrorArgs, autostart: bool) -> Result<()> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([720.0, 480.0])
-            .with_title("Quest scrcpy"),
+            .with_title("Quest scrcpy")
+            .with_icon(load_icon()),
         ..Default::default()
     };
     // Don't vsync-queue presents — show the freshest decoded frame immediately
@@ -170,6 +213,10 @@ fn main() -> Result<()> {
         }
         Some(Command::Record { args, seconds, output, crop, flatten }) => {
             run_record(args, seconds, output.into(), &crop, flatten)
+        }
+        Some(Command::Flat { serial, output, seconds, width, height, bitrate, fps }) => {
+            let serial = pick_serial(serial)?;
+            flat::run_flat_shot(&serial, output.into(), seconds, width, height, bitrate * 1_000_000, fps)
         }
         Some(Command::Shot { args, output }) => run_shot(args, output.into()),
     }

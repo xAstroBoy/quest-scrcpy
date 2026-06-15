@@ -12,6 +12,7 @@ On top of that, the Quest mirrors the stereoscopic, lens-distorted view. This cl
 
 ## Features
 
+- 🛰️ **Flat view (unrooted)** — one click streams the *whole* undistorted Quest view (home environment + floating panels, exactly like Meta's casting), live. A tiny on-device agent (pushed and run via `adb`, just like the scrcpy server — **no root**) composites the flat view and encodes H.264, so there's no lens de-warp to fiddle with.
 - 🎯 Device & display pickers over adb (shows every display the Quest exposes)
 - 📶 **Wireless adb** — connect a Quest by `ip[:port]`; remembered addresses get one-click reconnect chips + "Connect all"
 - 🥽 **One-click Quest 3 preset** — left eye, lens flattened, leveled
@@ -68,7 +69,9 @@ cargo build --release
 - `recorder.rs` — H.264 → MP4 mux via the Media Foundation sink writer
 - `audio.rs` / `audioplay.rs` — AAC → PCM via MF, played through cpal
 - `stream.rs` — the streaming thread tying it together
-- `app.rs` — the egui front-end (crop, lens flatten, capture controls)
+- `app.rs` — the egui front-end (crop, lens flatten, capture controls, **🥽 Flat view**)
+- `flat.rs` — the unrooted flat-view source: pushes/runs the on-device agent, pipes its H.264 over `adb exec-out`, decodes it
+- `agent/` — the on-device agent (`FlatStream`): an `app_process` (shell uid) that captures the whole flat view via `MediaProjectionManagerExt` + `MediaCodec`. Built to `assets/quest-flat-agent.jar`
 
 ## Third-party
 

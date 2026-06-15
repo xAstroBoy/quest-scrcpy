@@ -58,6 +58,8 @@ pub struct App {
     settings: Settings,
 
     stream: Option<StreamHandle>,
+    /// Live "flat view": the whole undistorted Quest view via the unrooted agent.
+    flat: Option<crate::flat::FlatHandle>,
     texture: Option<egui::TextureHandle>,
     last_generation: u64,
     tex_size: [usize; 2],
@@ -97,7 +99,10 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>, startup: StartupConfig) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, startup: StartupConfig) -> Self {
+        // egui's bundled font has no emoji glyphs, so load a system font that does
+        // (Segoe UI Emoji / Symbol) — otherwise 🥽🔊📷 etc. render as tofu boxes.
+        install_emoji_font(&cc.egui_ctx);
         // Saved settings are the baseline; explicit CLI flags override quality knobs.
         let cfg = Config::load().unwrap_or_default();
         let mut settings = Settings {
@@ -130,6 +135,7 @@ impl App {
             display_fetch: Arc::new(Mutex::new(None)),
             settings,
             stream: None,
+            flat: None,
             texture: None,
             last_generation: 0,
             tex_size: [0, 0],
@@ -271,8 +277,33 @@ impl App {
 
     fn disconnect(&mut self) {
         self.stream = None;
+        self.flat = None;
         self.texture = None;
         self.last_frame = None;
+    }
+
+    /// Start the live flat-view source: the whole undistorted Quest view (home
+    /// environment + panels) captured by the unrooted on-device agent. No lens
+    /// de-warp or crop — the device composites it flat for us.
+    fn connect_flat(&mut self, ctx: &egui::Context) {
+        let Some(serial) = self.selected_serial.clone() else { return };
+        self.stream = None;
+        self.flat = None;
+        self.texture = None;
+        self.last_frame = None;
+        self.last_generation = 0;
+        // The flat view is already undistorted, full-frame and level — no crop,
+        // no lens de-warp, and crucially no tilt (else we'd rotate a flat image).
+        self.lens_correct = false;
+        self.rotation_deg = 0.0;
+        self.uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        // Resolution / bitrate / fps from the quality knobs: Max size = width
+        // (16:9), so 1920→1080p, 2560→1440p, 3840→2160p; "Full panel" → 1080p.
+        let w = if self.settings.max_size >= 640 { self.settings.max_size } else { 1920 };
+        let h = (((w as u64 * 9) / 16) as u32) & !1;
+        let bitrate = self.settings.bitrate_mbps.max(2) * 1_000_000;
+        let fps = if self.settings.max_fps > 0 { self.settings.max_fps } else { 72 };
+        self.flat = Some(crate::flat::FlatHandle::start(serial, w, h, bitrate, fps, ctx.clone()));
     }
 
     /// Apply the baked-in "good Quest 3 view" in one click.
@@ -425,6 +456,19 @@ impl App {
         }
     }
 
+    /// Is the selected device a Meta/Quest headset? Those default to the flat
+    /// view (the "meta protocol"); the panel crop/lens/tilt tools don't apply.
+    fn selected_is_quest(&self) -> bool {
+        self.selected_serial
+            .as_ref()
+            .and_then(|s| self.devices.iter().find(|d| &d.serial == s))
+            .map(|d| {
+                let m = d.model.to_lowercase();
+                m.contains("quest") || m.contains("oculus") || m.contains("eureka") || m.contains("meta")
+            })
+            .unwrap_or(false)
+    }
+
     fn active_config_matches(&self) -> bool {
         let Some(s) = &self.stream else { return false };
         s.config.display_id == self.settings.display_id
@@ -436,8 +480,14 @@ impl App {
 
     /// Pull the newest decoded frame into the GPU texture, if any.
     fn sync_texture(&mut self, ctx: &egui::Context) {
-        let Some(stream) = &self.stream else { return };
-        let mut slot = stream.slot.lock().unwrap();
+        let slot_arc = if let Some(f) = &self.flat {
+            f.slot.clone()
+        } else if let Some(s) = &self.stream {
+            s.slot.clone()
+        } else {
+            return;
+        };
+        let mut slot = slot_arc.lock().unwrap();
         if slot.generation == self.last_generation {
             return;
         }
@@ -663,12 +713,32 @@ impl App {
 
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                let streaming = self.stream.is_some();
+                let streaming = self.stream.is_some() || self.flat.is_some();
                 if !streaming {
                     let enabled = self.selected_serial.is_some();
+                    let quest = self.selected_is_quest();
                     if ui
                         .add_enabled(enabled, egui::Button::new("▶  Connect"))
+                        .on_hover_text(if quest {
+                            "Live flat view (default for Meta/Quest): whole undistorted view, unrooted"
+                        } else {
+                            "Mirror this device"
+                        })
                         .clicked()
+                    {
+                        if quest {
+                            self.connect_flat(&ctx);
+                        } else {
+                            self.connect(&ctx);
+                        }
+                    }
+                    // Escape hatch for Quest: the raw panel mirror (stereo, lens-
+                    // warped) with the crop/flatten tools.
+                    if quest
+                        && ui
+                            .add_enabled(enabled, egui::Button::new("Panel view"))
+                            .on_hover_text("Raw panel mirror (stereo, lens-warped) — enables the crop/flatten tools")
+                            .clicked()
                     {
                         self.connect(&ctx);
                     }
@@ -676,7 +746,8 @@ impl App {
                     if ui.button("■  Disconnect").clicked() {
                         self.disconnect();
                     }
-                    if !self.active_config_matches()
+                    if self.stream.is_some()
+                        && !self.active_config_matches()
                         && ui
                             .button("⟳  Apply settings")
                             .on_hover_text("Reconnect with the new settings")
@@ -726,11 +797,15 @@ impl App {
     }
 
     fn status_label(&self, ui: &mut egui::Ui) {
-        let Some(stream) = &self.stream else {
+        let status = if let Some(f) = &self.flat {
+            f.status()
+        } else if let Some(s) = &self.stream {
+            s.status()
+        } else {
             ui.label("Idle");
             return;
         };
-        match stream.status() {
+        match status {
             Status::Connecting => {
                 ui.spinner();
                 ui.label("Connecting…");
@@ -753,6 +828,22 @@ impl App {
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("cropbar").show_inside(ui, |ui| {
             ui.add_space(3.0);
+            // The crop / zoom / lens / tilt tools only apply to the raw (stereo,
+            // lens-warped) panel mirror. In flat mode (the default for Meta/Quest)
+            // the device already composites a flat, full, undistorted view — so
+            // hide them. They re-appear for the Panel view or non-Meta devices.
+            let show_tools =
+                self.flat.is_none() && (self.stream.is_some() || !self.selected_is_quest());
+            if !show_tools {
+                ui.label(
+                    egui::RichText::new(
+                        "🥽 Flat view — whole undistorted stream (crop / lens / tilt not needed)",
+                    )
+                    .weak(),
+                );
+                ui.add_space(3.0);
+                return;
+            }
             ui.horizontal_wrapped(|ui| {
                 // One-click "good Quest 3 view": left eye + lens flattened + level.
                 if ui
@@ -834,7 +925,7 @@ impl App {
     fn central_video(&mut self, ui: &mut egui::Ui) {
         let Some(texture) = self.texture.clone() else {
             ui.centered_and_justified(|ui| {
-                let msg = if self.stream.is_some() {
+                let msg = if self.stream.is_some() || self.flat.is_some() {
                     "Waiting for first frame…"
                 } else {
                     "Pick your Quest and hit Connect."
@@ -894,6 +985,21 @@ impl App {
                 }
             }
     }
+}
+
+/// Add a monochrome emoji font (bundled Noto Emoji) as a fallback so the UI's
+/// 🥽🔊📷⏺🔗 glyphs render — egui's built-in font only covers a tiny icon
+/// subset, and color fonts (Segoe UI Emoji) don't render in egui's rasterizer.
+fn install_emoji_font(ctx: &egui::Context) {
+    const NOTO_EMOJI: &[u8] = include_bytes!("../assets/NotoEmoji-Regular.ttf");
+    let mut fonts = egui::FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("noto_emoji".to_owned(), Arc::new(egui::FontData::from_static(NOTO_EMOJI)));
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(fam).or_default().push("noto_emoji".to_owned());
+    }
+    ctx.set_fonts(fonts);
 }
 
 /// `captures/` folder next to the executable (created on demand).

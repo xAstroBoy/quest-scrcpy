@@ -8,11 +8,20 @@ quest-scrcpy.cfg
 # Local test / diagnostic artifacts
 *.mp4
 *.png
+*.h264
+gui_out.txt
+gui_err.txt
 *.log
 *_log.txt
 server_log.txt
 diag_shot.png
 undist_preview*.png
+
+# Reverse-engineering scratch: pulled Meta binaries (proprietary, do not commit)
+/re
+
+# On-device agent build artifacts (keep src, drop compiled dex/jar)
+/agent/build
 
 # Allow the embedded server jar (required for the build)
 !assets/**
