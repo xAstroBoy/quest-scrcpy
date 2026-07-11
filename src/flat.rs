@@ -86,6 +86,15 @@ fn push_agent(serial: &str) -> Result<()> {
     Ok(())
 }
 
+/// Kill any lingering device-side agent so a (re)connect never runs two at once
+/// (two VirtualDisplays can wedge the headset). Best-effort.
+fn kill_device_agent(serial: &str) {
+    let _ = adb_cmd(&["-s", serial, "shell", "pkill", "-f", AGENT_MAIN])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Launch the agent over `adb exec-out` (binary stdout = the H.264 stream).
 fn spawn_agent(serial: &str, w: u32, h: u32, bitrate: u32, fps: u32) -> Result<Child> {
     let shell = format!(
@@ -244,22 +253,52 @@ impl FlatHandle {
             std::thread::Builder::new()
                 .name("flat-stream".into())
                 .spawn(move || {
-                    if let Err(e) = run_gui(
-                        &serial, w, h, bitrate, fps, &stop, &slot, &status, &child, &recording,
-                        &record_rx, &repaint,
-                    ) {
-                        if !stop.load(Ordering::Relaxed) {
-                            *status.lock().unwrap() = Status::Error(format!("{e:#}"));
-                            repaint.request_repaint();
+                    // The wireless Quest drops the adb pipe now and then; keep the
+                    // view alive by reconnecting. Gentle backoff (2s..10s) so we
+                    // never hammer a flaky device with a tight reconnect loop.
+                    let base = Duration::from_secs(2);
+                    let cap = Duration::from_secs(10);
+                    let mut backoff = base;
+                    while !stop.load(Ordering::Relaxed) {
+                        let started = Instant::now();
+                        let result = run_gui(
+                            &serial, w, h, bitrate, fps, &stop, &slot, &status, &child,
+                            &recording, &record_rx, &repaint,
+                        );
+                        // Tear down this attempt's child before retrying.
+                        recording.store(false, Ordering::Relaxed);
+                        if let Some(c) = child.lock().unwrap().as_mut() {
+                            let _ = c.kill();
                         }
+                        *child.lock().unwrap() = None;
+
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if let Err(e) = &result {
+                            eprintln!("[flat] stream dropped: {e:#}");
+                        }
+                        // A stream that ran a good while then dropped → reconnect
+                        // promptly; repeated quick failures → back off.
+                        if started.elapsed() >= Duration::from_secs(8) {
+                            backoff = base;
+                        }
+                        *status.lock().unwrap() = Status::Connecting;
+                        repaint.request_repaint();
+
+                        // Wait out the backoff, but wake immediately on stop.
+                        let mut waited = Duration::ZERO;
+                        while waited < backoff && !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(100));
+                            waited += Duration::from_millis(100);
+                        }
+                        backoff = (backoff * 2).min(cap);
                     }
                     recording.store(false, Ordering::Relaxed);
                     if let Some(c) = child.lock().unwrap().as_mut() {
                         let _ = c.kill();
                     }
-                    if !stop.load(Ordering::Relaxed) {
-                        *status.lock().unwrap() = Status::Stopped;
-                    }
+                    *status.lock().unwrap() = Status::Stopped;
                 })
                 .expect("spawn flat thread")
         };
@@ -316,6 +355,10 @@ fn run_gui(
     record_rx: &Receiver<FlatRec>,
     repaint: &egui::Context,
 ) -> Result<()> {
+    // Ensure no previous agent is still alive (leftover session or a reconnect),
+    // then give the headset a moment to release its VirtualDisplay.
+    kill_device_agent(serial);
+    std::thread::sleep(Duration::from_millis(300));
     push_agent(serial)?;
     let mut child = spawn_agent(serial, w, h, bitrate, fps)?;
     drain_stderr(&mut child);

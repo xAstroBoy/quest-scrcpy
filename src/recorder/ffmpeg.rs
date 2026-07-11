@@ -82,17 +82,23 @@ impl FfmpegEncoder {
     pub fn new(path: &Path, width: u32, height: u32, fps_hint: u32, bitrate: u32) -> Result<Self> {
         let width = width.max(2) & !1; // H.264 needs even dimensions
         let height = height.max(2) & !1;
-        let fps = if fps_hint > 0 { fps_hint } else { 60 };
+        let _ = fps_hint; // frame timing comes from wall-clock, not a fixed rate
         let bitrate = if bitrate > 0 { bitrate } else { 12_000_000 };
         let video_tmp = path.with_extension("video.tmp.mp4");
 
+        // Timestamp frames by wall-clock arrival, NOT a fixed input rate: the
+        // flat stream's real frame-rate is variable and usually below the nominal
+        // fps, so a fixed `-r` would compress the video in time (played back
+        // sped-up) and drift out of sync with the real-time audio. Wall-clock
+        // stamps + VFR output keep the recording at true speed.
         let mut cmd = crate::ffmpeg::command().ok_or_else(|| anyhow!("ffmpeg not available"))?;
         cmd.args(["-f", "rawvideo", "-pix_fmt", "bgra"])
             .args(["-s", &format!("{width}x{height}")])
-            .args(["-r", &fps.to_string()])
+            .args(["-use_wallclock_as_timestamps", "1"])
             .args(["-i", "pipe:0"])
             .args(["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p"])
             .args(["-b:v", &bitrate.to_string()])
+            .args(["-fps_mode", "vfr"])
             .arg("-y")
             .arg(&video_tmp)
             .stdin(Stdio::piped())
