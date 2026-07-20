@@ -96,9 +96,10 @@ fn kill_device_agent(serial: &str) {
 }
 
 /// Launch the agent over `adb exec-out` (binary stdout = the H.264 stream).
-fn spawn_agent(serial: &str, w: u32, h: u32, bitrate: u32, fps: u32) -> Result<Child> {
+fn spawn_agent(serial: &str, w: u32, h: u32, bitrate: u32, fps: u32, audio: bool) -> Result<Child> {
+    let a = if audio { 1 } else { 0 };
     let shell = format!(
-        "CLASSPATH={AGENT_DEVICE_PATH} app_process /system/bin {AGENT_MAIN} -w {w} -h {h} -b {bitrate} -f {fps}"
+        "CLASSPATH={AGENT_DEVICE_PATH} app_process /system/bin {AGENT_MAIN} -w {w} -h {h} -b {bitrate} -f {fps} -a {a}"
     );
     adb_cmd(&["-s", serial, "exec-out", &shell])
         .stdout(Stdio::piped())
@@ -180,7 +181,8 @@ pub fn run_flat_shot(
     fps: u32,
 ) -> Result<()> {
     push_agent(serial)?;
-    let mut child = spawn_agent(serial, w, h, bitrate, fps)?;
+    // Headless one-shot: video only, no need to capture audio.
+    let mut child = spawn_agent(serial, w, h, bitrate, fps, false)?;
     drain_stderr(&mut child);
     let mut stdout = child.stdout.take().context("agent stdout missing")?;
 
@@ -215,12 +217,23 @@ pub fn run_flat_shot(
 
 /// A live flat-view session for the GUI: owns the agent + decode thread and
 /// publishes the latest frame into a [`FrameSlot`] (same as the scrcpy path).
+/// What a running flat stream was started with, so the GUI can tell when the
+/// quality/audio knobs no longer match and offer to re-apply them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FlatConfig {
+    pub max_size: u32,
+    pub bitrate: u32,
+    pub fps: u32,
+    pub audio: bool,
+}
+
 pub struct FlatHandle {
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     child: Arc<Mutex<Option<Child>>>,
     pub slot: Arc<Mutex<FrameSlot>>,
     pub status: Arc<Mutex<Status>>,
+    pub config: FlatConfig,
     record_tx: Sender<FlatRec>,
     recording: Arc<AtomicBool>,
 }
@@ -232,6 +245,7 @@ impl FlatHandle {
         h: u32,
         bitrate: u32,
         fps: u32,
+        audio: bool,
         repaint: egui::Context,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
@@ -262,7 +276,7 @@ impl FlatHandle {
                     while !stop.load(Ordering::Relaxed) {
                         let started = Instant::now();
                         let result = run_gui(
-                            &serial, w, h, bitrate, fps, &stop, &slot, &status, &child,
+                            &serial, w, h, bitrate, fps, audio, &stop, &slot, &status, &child,
                             &recording, &record_rx, &repaint,
                         );
                         // Tear down this attempt's child before retrying.
@@ -303,7 +317,16 @@ impl FlatHandle {
                 .expect("spawn flat thread")
         };
 
-        Self { stop, join: Some(join), child, slot, status, record_tx, recording }
+        Self {
+            stop,
+            join: Some(join),
+            child,
+            slot,
+            status,
+            config: FlatConfig { max_size: w, bitrate, fps, audio },
+            record_tx,
+            recording,
+        }
     }
 
     pub fn status(&self) -> Status {
@@ -347,6 +370,7 @@ fn run_gui(
     h: u32,
     bitrate: u32,
     fps: u32,
+    audio_on: bool,
     stop: &Arc<AtomicBool>,
     slot: &Arc<Mutex<FrameSlot>>,
     status: &Arc<Mutex<Status>>,
@@ -360,7 +384,7 @@ fn run_gui(
     kill_device_agent(serial);
     std::thread::sleep(Duration::from_millis(300));
     push_agent(serial)?;
-    let mut child = spawn_agent(serial, w, h, bitrate, fps)?;
+    let mut child = spawn_agent(serial, w, h, bitrate, fps, audio_on)?;
     drain_stderr(&mut child);
     let mut stdout = child.stdout.take().context("agent stdout missing")?;
     *child_slot.lock().unwrap() = Some(child);
@@ -422,6 +446,9 @@ fn run_gui(
         };
         if kind != 0 {
             // 1 = AAC frame, 2 = AAC codec config.
+            if !audio_on {
+                continue; // audio toggle is off — don't play or record it
+            }
             audio_pkts += 1;
             if audio_pkts == 1 {
                 flat_log(&format!("first audio packet from agent (kind={kind}, {} bytes)", data.len()));

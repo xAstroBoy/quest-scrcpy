@@ -45,6 +45,8 @@ public class FlatStream {
     // Log to logcat ONLY — stdout must stay pure H.264 (it's piped via exec-out).
     static void log(String s) { Log.i(TAG, s); }
     static int W = 1280, H = 720, BITRATE = 12_000_000, FPS = 60;
+    /// `-a 0` disables audio capture entirely (honours the client's audio toggle).
+    static boolean AUDIO = true;
     static volatile boolean running = true;
 
     public static void main(String[] a) {
@@ -54,6 +56,7 @@ public class FlatStream {
                 case "-h": H = Integer.parseInt(a[i + 1]); break;
                 case "-b": BITRATE = Integer.parseInt(a[i + 1]); break;
                 case "-f": FPS = Integer.parseInt(a[i + 1]); break;
+                case "-a": AUDIO = !"0".equals(a[i + 1]); break;
             }
         }
         try { run(); } catch (Throwable t) { Log.e(TAG, "FATAL", t); System.exit(1); }
@@ -168,7 +171,11 @@ public class FlatStream {
         out.writeInt(H);
         out.flush();
         log("streaming " + W + "x" + H + " to stdout");
-        startAudioCapture(out, mp); // best-effort device audio -> AAC, interleaved
+        if (AUDIO) {
+            startAudioCapture(out, mp); // best-effort device audio -> AAC, interleaved
+        } else {
+            log("audio: disabled by client (-a 0)");
+        }
 
         MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
         long frames = 0, bytes = 0;

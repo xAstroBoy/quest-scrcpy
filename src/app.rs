@@ -301,11 +301,16 @@ impl App {
         // bounding box (max_size × max_size); the agent fits the real flat-view
         // aspect inside it, so the longer side reaches max_size whatever the
         // shape — no forced 16:9 that would letterbox/crop the view.
-        let w = if self.settings.max_size >= 640 { self.settings.max_size } else { 1920 };
-        let h = w;
-        let bitrate = self.settings.bitrate_mbps.max(2) * 1_000_000;
-        let fps = if self.settings.max_fps > 0 { self.settings.max_fps } else { 72 };
-        self.flat = Some(crate::flat::FlatHandle::start(serial, w, h, bitrate, fps, ctx.clone()));
+        let cfg = self.flat_config();
+        self.flat = Some(crate::flat::FlatHandle::start(
+            serial,
+            cfg.max_size,
+            cfg.max_size, // square bounding box; the agent fits the real aspect in it
+            cfg.bitrate,
+            cfg.fps,
+            cfg.audio,
+            ctx.clone(),
+        ));
     }
 
     /// Apply the baked-in "good Quest 3 view" in one click.
@@ -479,12 +484,28 @@ impl App {
     }
 
     fn active_config_matches(&self) -> bool {
+        // The flat view has its own knobs (size/bitrate/fps/audio) — it needs a
+        // reconnect to pick up changes just like the panel mirror does.
+        if let Some(f) = &self.flat {
+            let want = self.flat_config();
+            return f.config == want;
+        }
         let Some(s) = &self.stream else { return false };
         s.config.display_id == self.settings.display_id
             && s.config.max_size == self.settings.max_size
             && s.config.video_bit_rate == self.settings.bitrate_mbps * 1_000_000
             && s.config.max_fps == self.settings.max_fps
             && s.config.audio == self.settings.audio
+    }
+
+    /// The flat-view parameters implied by the current settings.
+    fn flat_config(&self) -> crate::flat::FlatConfig {
+        crate::flat::FlatConfig {
+            max_size: if self.settings.max_size >= 640 { self.settings.max_size } else { 1920 },
+            bitrate: self.settings.bitrate_mbps.max(2) * 1_000_000,
+            fps: if self.settings.max_fps > 0 { self.settings.max_fps } else { 72 },
+            audio: self.settings.audio,
+        }
     }
 
     /// Pull the newest decoded frame into the GPU texture, if any.
@@ -755,14 +776,18 @@ impl App {
                     if ui.button("■  Disconnect").clicked() {
                         self.disconnect();
                     }
-                    if self.stream.is_some()
+                    if (self.stream.is_some() || self.flat.is_some())
                         && !self.active_config_matches()
                         && ui
                             .button("⟳  Apply settings")
                             .on_hover_text("Reconnect with the new settings")
                             .clicked()
                     {
-                        self.connect(&ctx);
+                        if self.flat.is_some() {
+                            self.connect_flat(&ctx);
+                        } else {
+                            self.connect(&ctx);
+                        }
                     }
                 }
 
