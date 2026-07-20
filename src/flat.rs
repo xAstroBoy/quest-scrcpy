@@ -218,13 +218,13 @@ pub fn run_flat_shot(
 /// A live flat-view session for the GUI: owns the agent + decode thread and
 /// publishes the latest frame into a [`FrameSlot`] (same as the scrcpy path).
 /// What a running flat stream was started with, so the GUI can tell when the
-/// quality/audio knobs no longer match and offer to re-apply them.
+/// quality knobs no longer match and offer to re-apply them. Audio is NOT here:
+/// it's toggled live (the agent always streams it, the client mutes).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FlatConfig {
     pub max_size: u32,
     pub bitrate: u32,
     pub fps: u32,
-    pub audio: bool,
 }
 
 pub struct FlatHandle {
@@ -234,6 +234,8 @@ pub struct FlatHandle {
     pub slot: Arc<Mutex<FrameSlot>>,
     pub status: Arc<Mutex<Status>>,
     pub config: FlatConfig,
+    /// Live audio toggle — flipped from the GUI without reconnecting.
+    audio_enabled: Arc<AtomicBool>,
     record_tx: Sender<FlatRec>,
     recording: Arc<AtomicBool>,
 }
@@ -248,6 +250,7 @@ impl FlatHandle {
         audio: bool,
         repaint: egui::Context,
     ) -> Self {
+        let audio_enabled = Arc::new(AtomicBool::new(audio));
         let stop = Arc::new(AtomicBool::new(false));
         let slot = Arc::new(Mutex::new(FrameSlot::default()));
         let status = Arc::new(Mutex::new(Status::Connecting));
@@ -256,13 +259,14 @@ impl FlatHandle {
         let (record_tx, record_rx) = unbounded();
 
         let join = {
-            let (stop, slot, status, child, serial, recording) = (
+            let (stop, slot, status, child, serial, recording, audio_enabled) = (
                 stop.clone(),
                 slot.clone(),
                 status.clone(),
                 child.clone(),
                 serial.clone(),
                 recording.clone(),
+                audio_enabled.clone(),
             );
             std::thread::Builder::new()
                 .name("flat-stream".into())
@@ -276,8 +280,8 @@ impl FlatHandle {
                     while !stop.load(Ordering::Relaxed) {
                         let started = Instant::now();
                         let result = run_gui(
-                            &serial, w, h, bitrate, fps, audio, &stop, &slot, &status, &child,
-                            &recording, &record_rx, &repaint,
+                            &serial, w, h, bitrate, fps, &audio_enabled, &stop, &slot, &status,
+                            &child, &recording, &record_rx, &repaint,
                         );
                         // Tear down this attempt's child before retrying.
                         recording.store(false, Ordering::Relaxed);
@@ -323,10 +327,17 @@ impl FlatHandle {
             child,
             slot,
             status,
-            config: FlatConfig { max_size: w, bitrate, fps, audio },
+            config: FlatConfig { max_size: w, bitrate, fps },
+            audio_enabled,
             record_tx,
             recording,
         }
+    }
+
+    /// Mute/unmute the stream's audio live (no reconnect). The agent keeps
+    /// sending it; we just stop playing/recording it.
+    pub fn set_audio_enabled(&self, on: bool) {
+        self.audio_enabled.store(on, Ordering::Relaxed);
     }
 
     pub fn status(&self) -> Status {
@@ -370,7 +381,7 @@ fn run_gui(
     h: u32,
     bitrate: u32,
     fps: u32,
-    audio_on: bool,
+    audio_enabled: &Arc<AtomicBool>,
     stop: &Arc<AtomicBool>,
     slot: &Arc<Mutex<FrameSlot>>,
     status: &Arc<Mutex<Status>>,
@@ -384,7 +395,9 @@ fn run_gui(
     kill_device_agent(serial);
     std::thread::sleep(Duration::from_millis(300));
     push_agent(serial)?;
-    let mut child = spawn_agent(serial, w, h, bitrate, fps, audio_on)?;
+    // Always ask the agent for audio; muting is decided client-side so the
+    // toggle takes effect instantly instead of needing a reconnect.
+    let mut child = spawn_agent(serial, w, h, bitrate, fps, true)?;
     drain_stderr(&mut child);
     let mut stdout = child.stdout.take().context("agent stdout missing")?;
     *child_slot.lock().unwrap() = Some(child);
@@ -402,6 +415,8 @@ fn run_gui(
     // lazily on the first audio packet (the agent sends config first).
     let mut audio: Option<crate::audioplay::AacPlayer> = None;
     let mut audio_pkts = 0u64;
+    // Has the current player been given the AAC config yet?
+    let mut player_configured = false;
     // Recording: the flat frames are already what's on screen, so just re-encode
     // them (RGBA->BGRA) to MP4. Created on the first frame after a Start command.
     let mut clip: Option<ClipEncoder> = None;
@@ -446,16 +461,24 @@ fn run_gui(
         };
         if kind != 0 {
             // 1 = AAC frame, 2 = AAC codec config.
-            if !audio_on {
-                continue; // audio toggle is off — don't play or record it
+            // Always remember the config: it arrives once, so re-enabling audio
+            // later still needs it to (re)configure the player.
+            if kind == 2 {
+                audio_config = Some(data.clone());
+                flat_log(&format!("AAC config received ({} bytes)", data.len()));
+            }
+            if !audio_enabled.load(Ordering::Relaxed) {
+                // Muted: drop the player so re-enabling starts clean.
+                if audio.is_some() {
+                    flat_log("audio muted by toggle");
+                    audio = None;
+                    player_configured = false;
+                }
+                continue;
             }
             audio_pkts += 1;
             if audio_pkts == 1 {
                 flat_log(&format!("first audio packet from agent (kind={kind}, {} bytes)", data.len()));
-            }
-            if kind == 2 {
-                audio_config = Some(data.clone());
-                flat_log(&format!("AAC config received ({} bytes)", data.len()));
             }
             // Mux audio into an active recording (config first, then frames).
             if let Some(enc) = clip.as_mut() {
@@ -470,13 +493,25 @@ fn run_gui(
                     Ok(p) => {
                         flat_log("audio player created");
                         audio = Some(p);
+                        player_configured = false;
                     }
                     Err(e) => flat_log(&format!("audio init FAILED: {e:#}")),
                 }
             }
             if let Some(p) = audio.as_mut() {
-                if let Err(e) = p.feed(&data, kind == 2) {
-                    flat_log(&format!("audio feed error: {e:#}"));
+                // A player made after the config packet went by still needs it.
+                if !player_configured {
+                    if let Some(asc) = audio_config.as_ref() {
+                        if let Err(e) = p.feed(asc, true) {
+                            flat_log(&format!("audio config feed error: {e:#}"));
+                        }
+                        player_configured = true;
+                    }
+                }
+                if kind == 1 {
+                    if let Err(e) = p.feed(&data, false) {
+                        flat_log(&format!("audio feed error: {e:#}"));
+                    }
                 }
             }
             continue;

@@ -308,7 +308,7 @@ impl App {
             cfg.max_size, // square bounding box; the agent fits the real aspect in it
             cfg.bitrate,
             cfg.fps,
-            cfg.audio,
+            self.settings.audio, // initial mute state; toggled live afterwards
             ctx.clone(),
         ));
     }
@@ -498,13 +498,13 @@ impl App {
             && s.config.audio == self.settings.audio
     }
 
-    /// The flat-view parameters implied by the current settings.
+    /// The flat-view parameters implied by the current settings. Audio isn't
+    /// here — it's applied live (see `set_audio_enabled`), no reconnect needed.
     fn flat_config(&self) -> crate::flat::FlatConfig {
         crate::flat::FlatConfig {
             max_size: if self.settings.max_size >= 640 { self.settings.max_size } else { 1920 },
             bitrate: self.settings.bitrate_mbps.max(2) * 1_000_000,
             fps: if self.settings.max_fps > 0 { self.settings.max_fps } else { 72 },
-            audio: self.settings.audio,
         }
     }
 
@@ -551,6 +551,10 @@ impl eframe::App for App {
         self.poll_connect();
         self.poll_displays();
         self.drive_display_fetch();
+        // The audio toggle applies to the flat stream live (no reconnect).
+        if let Some(f) = &self.flat {
+            f.set_audio_enabled(self.settings.audio);
+        }
         self.sync_texture(ctx);
         self.autosave();
     }
